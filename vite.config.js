@@ -56,7 +56,7 @@ function envPlugin() {
       html = stripCspMeta(html)
       html = injectTitle(html, title)
       html = injectApiBase(html, rawApiDomains)
-      if (backgroundImage || mobileBackgroundImage) {
+      if (process.env.VITE_SKIP_BG_INJECT !== '1' && (backgroundImage || mobileBackgroundImage)) {
         const bgStyle = buildBackgroundStyle(backgroundImage, mobileBackgroundImage)
         html = html.replace('</head>', `${bgStyle}\n</head>`)
       }
@@ -65,37 +65,47 @@ function envPlugin() {
   }
 }
 
-export default defineConfig({
-  plugins: [vue(), mkcert(), envPlugin()],
-  base: process.env.VITE_BASE || '/',
-  resolve: {
-    alias: {
-      '@': path.resolve(__dirname, 'src/frontend')
-    }
-  },
-  build: {
-    outDir: 'dist',
-    assetsDir: 'static',
-    emptyOutDir: true,
-    rollupOptions: {
-      output: {
-        entryFileNames: 'static/[name]-[hash].js',
-        chunkFileNames: 'static/[name]-[hash].js',
-        assetFileNames: 'static/[name]-[hash].[ext]'
+export default defineConfig(({ command }) => {
+  const enableHttps = command === 'serve'
+    && process.env.VITE_DISABLE_MKCERT !== '1'
+    && process.env.NODE_ENV !== 'test'
+
+  return {
+    plugins: [
+      vue(),
+      ...(enableHttps ? [mkcert()] : []),
+      envPlugin()
+    ],
+    base: process.env.VITE_BASE || '/',
+    resolve: {
+      alias: {
+        '@': path.resolve(__dirname, 'src/frontend')
       }
-    }
-  },
-  server: {
-    https: true,
-    port: 5173,
-    proxy: {
-      '/api': createWorkerProxy(),
-      '/admin/api': createWorkerProxy(),
-      '/theme': createWorkerProxy(),
-      '/update': createWorkerProxy(),
-      '/updateDatabase': createWorkerProxy(),
-      '/clearHistory': createWorkerProxy(),
-      '/__do': createWorkerProxy()
+    },
+    build: {
+      outDir: 'dist',
+      assetsDir: 'static',
+      emptyOutDir: true,
+      rollupOptions: {
+        output: {
+          entryFileNames: 'static/[name]-[hash].js',
+          chunkFileNames: 'static/[name]-[hash].js',
+          assetFileNames: 'static/[name]-[hash].[ext]'
+        }
+      }
+    },
+    server: {
+      ...(enableHttps ? { https: true } : {}),
+      port: 5173,
+      proxy: {
+        '/api': createWorkerProxy(),
+        '/admin/api': createWorkerProxy(),
+        '/theme': createWorkerProxy(),
+        '/update': createWorkerProxy(),
+        '/updateDatabase': createWorkerProxy(),
+        '/clearHistory': createWorkerProxy(),
+        '/__do': createWorkerProxy()
+      }
     }
   }
 })

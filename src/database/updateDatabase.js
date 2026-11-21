@@ -108,15 +108,26 @@ export async function addServerColumns(db) {
         `SELECT id, price FROM servers`
       ).all();
 
-      for (const server of servers) {
+      const statements = servers.map(server => {
         const normalizedPrice = normalizePrice(server.price);
         const billingCycle = normalizeBillingCycle(detectBillingCycle(server.price));
         const currency = normalizeCurrency(detectCurrencySymbol(server.price) || '¥');
-
-        await db.prepare(
+        return db.prepare(
           `UPDATE servers SET price = ?, billing_cycle = ?, currency = ? WHERE id = ?`
-        ).bind(normalizedPrice, billingCycle, currency, server.id).run();
-        migratedPrices++;
+        ).bind(normalizedPrice, billingCycle, currency, server.id);
+      });
+
+      const PRICE_MIGRATION_BATCH_SIZE = 50;
+      for (let offset = 0; offset < statements.length; offset += PRICE_MIGRATION_BATCH_SIZE) {
+        const chunk = statements.slice(offset, offset + PRICE_MIGRATION_BATCH_SIZE);
+        if (typeof db.batch === 'function') {
+          await db.batch(chunk);
+        } else {
+          for (const stmt of chunk) {
+            await stmt.run();
+          }
+        }
+        migratedPrices += chunk.length;
       }
     }
     

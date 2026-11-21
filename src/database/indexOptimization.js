@@ -1,12 +1,31 @@
 import { saveSiteOptions, debug, getSettingByKey } from '../utils/settings.js';
-import { getAllServers, clearServersListCache } from '../utils/cache.js';
+import { getAllServers, clearServersListCache, clearServerDetailCache } from '../utils/cache.js';
 
 export const HISTORY_PARTITION_MULTIPLIER = 10000000000000;
 export const HISTORY_MAX_PARTITION_ID = 900;
 export const HISTORY_MAX_TIME_KEY = 991231235959;
+export const SERVERS_HISTORY_PARTITION_UNIQUE_INDEX_SQL =
+  'CREATE UNIQUE INDEX IF NOT EXISTS idx_servers_history_partition_unique ON servers(history_partition_id) WHERE history_partition_id > 0';
+
+export function isHistoryPartitionUniqueError(error) {
+  const message = error?.message || String(error || '');
+  return /UNIQUE constraint failed:\s*servers\.history_partition_id/i.test(message) ||
+    /idx_servers_history_partition_unique/i.test(message);
+}
+
+async function ensureHistoryPartitionUniqueIndex(db) {
+  try {
+    await db.prepare(SERVERS_HISTORY_PARTITION_UNIQUE_INDEX_SQL).run();
+  } catch (e) {
+    debug(`Failed to create history_partition_id unique index: ${e?.message || e}`);
+  }
+}
 
 // 确保servers历史记录分区优化
-export async function ensureServerOptimization(db) {
+export async function ensureServerOptimization(db, options = {}) {
+  const forceServerId = typeof options === 'string'
+    ? options.trim()
+    : String(options?.forceServerId || '').trim();
   const optimized = await getSettingByKey(db, 'servers_optimized', true);
   const { results: columns = [] } = await db.prepare(`PRAGMA table_info(servers)`).all();
   const existingColumns = new Set(columns.map(column => column.name));
@@ -26,11 +45,21 @@ export async function ensureServerOptimization(db) {
 
   if (addedColumns > 0) {
     clearServersListCache();
+    clearServerDetailCache();
   }
 
-  if (optimized && addedColumns === 0) {
-    debug('服务器历史记录分区已优化');
-    return { success: true, assigned: 0 };
+  if (optimized && addedColumns === 0 && !forceServerId) {
+    try {
+      await db.prepare(SERVERS_HISTORY_PARTITION_UNIQUE_INDEX_SQL).run();
+      debug('服务器历史记录分区已优化');
+      return { success: true, assigned: 0 };
+    } catch (indexErr) {
+      if (!isHistoryPartitionUniqueError(indexErr)) {
+        debug(`Failed to verify history_partition_id unique index: ${indexErr?.message || indexErr}`);
+        return { success: true, assigned: 0 };
+      }
+      debug('检测到存量重复 history_partition_id，继续执行去重重分配自愈');
+    }
   }
 
   const { results: servers = [] } = await db.prepare(`
@@ -38,9 +67,10 @@ export async function ensureServerOptimization(db) {
     FROM servers
     ORDER BY id ASC
   `).all();
-  
+
   if (servers.length === 0) {
     debug('没有服务器需要优化');
+    await ensureHistoryPartitionUniqueIndex(db);
     await saveSiteOptions(db, { servers_optimized: 'true' });
     return { success: true, assigned: 0 };
   }
@@ -49,41 +79,90 @@ export async function ensureServerOptimization(db) {
     throw new Error(`No available history partition id; max is ${HISTORY_MAX_PARTITION_ID}`);
   }
 
-  let updated = 0;
-
-  for (let i = 0; i < servers.length; i++) {
-    const server = servers[i];
-    const partitionId = i + 1;
-    if (Number(server.history_partition_id) === partitionId) {
-      continue;
-    }
-
-    try {
-      await db.prepare(
-        `UPDATE servers SET history_partition_id = ? WHERE id = ?`
-      ).bind(partitionId, server.id).run();
-      updated++;
-    } catch (e) {
-      debug(`Failed to update server ${server.id} history_partition_id: ${e.message}`);
+  // 只给尚未分配有效唯一分区 ID 的服务器补分配，已有唯一有效 ID 一律保留：
+  // 历史行主键前缀就是分区 ID（buildHistoryId），按行号重排会让旧历史无法命中，
+  // 且删除节点释放的前缀被后续服务器复用后会读到别的服务器的旧数据。
+  const usedIds = new Set();
+  const unassignedServers = [];
+  for (const server of servers) {
+    const pid = Number(server.history_partition_id);
+    if (Number.isInteger(pid) && pid > 0 && pid <= HISTORY_MAX_PARTITION_ID && !usedIds.has(pid)) {
+      usedIds.add(pid);
+    } else {
+      unassignedServers.push(server);
     }
   }
 
-  // 清空服务器列表的缓存
-  clearServersListCache();
+  if (unassignedServers.length === 0) {
+    debug('所有服务器均已分配历史分区 ID');
+    await ensureHistoryPartitionUniqueIndex(db);
+    clearServersListCache();
+    clearServerDetailCache();
+    await saveSiteOptions(db, { servers_optimized: 'true' });
+    return { success: true, assigned: 0 };
+  }
 
-  debug(`服务器历史记录分区优化完成，更新了 ${updated} 条记录`);
-  
-  // 标记为已优化
+  let nextId = 1;
+  let updated = 0;
+  let failedCount = 0;
+
+  for (const server of unassignedServers) {
+    let assigned = false;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      while (nextId <= HISTORY_MAX_PARTITION_ID && usedIds.has(nextId)) {
+        nextId++;
+      }
+      if (nextId > HISTORY_MAX_PARTITION_ID) {
+        throw new Error(`No available history partition id; max is ${HISTORY_MAX_PARTITION_ID}`);
+      }
+      const candidateId = nextId;
+      usedIds.add(candidateId);
+
+      try {
+        await db.prepare(
+          `UPDATE servers SET history_partition_id = ? WHERE id = ?`
+        ).bind(candidateId, server.id).run();
+        updated++;
+        assigned = true;
+        break;
+      } catch (e) {
+        if (isHistoryPartitionUniqueError(e) && attempt < 2) {
+          continue;
+        }
+        debug(`Failed to update server ${server.id} history_partition_id: ${e.message}`);
+        break;
+      }
+    }
+    if (!assigned) {
+      failedCount++;
+    }
+  }
+
+  // 清空服务器列表与详情缓存
+  clearServersListCache();
+  clearServerDetailCache();
+
+  debug(`服务器历史记录分区优化完成，更新了 ${updated} 条记录，失败 ${failedCount} 条`);
+
+  if (failedCount > 0) {
+    return { success: false, assigned: updated, failed: failedCount };
+  }
+
+  await ensureHistoryPartitionUniqueIndex(db);
+
+  // 全部成功才标记为已优化
   await saveSiteOptions(db, { servers_optimized: 'true' });
 
   return { success: true, assigned: updated };
 }
 
-// 获取下一个可用的历史记录分区ID
+// 获取下一个可用的历史记录分区ID（直查 D1，避免读取 120s 过期缓存导致并发分配冲突）
 export async function getNextServerHistoryPartitionId(db) {
-  const servers = await getAllServers(db, true);
+  const { results = [] } = await db.prepare(
+    'SELECT history_partition_id FROM servers WHERE history_partition_id > 0'
+  ).all();
   const usedIds = new Set(
-    servers
+    results
       .map(s => Number(s.history_partition_id))
       .filter(id => Number.isInteger(id) && id > 0 && id <= HISTORY_MAX_PARTITION_ID)
   );

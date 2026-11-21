@@ -1,4 +1,5 @@
-import { saveMetricsHistory } from '../database/schema.js';
+import { clampMetricTimestamp, saveMetricsHistory } from '../database/schema.js';
+import { timingSafeEqualString } from '../utils/common.js';
 import { getServerDetail, clearServerDetailCache, patchServerDetailCache } from '../utils/cache.js';
 import { evaluateTrafficAlert } from '../services/notification.js';
 import {
@@ -66,11 +67,13 @@ const AGENT_WSS_MODE_HEADER = 'X-Agent-Wss-Mode';
 const AGENT_WSS_REASON_HEADER = 'X-Agent-Wss-Reason';
 const AGENT_WSS_SCHEDULE_INACTIVE = 'wss_schedule_inactive';
 const AGENT_WSS_SCHEDULE_DISABLED = 'wss_disabled';
+const SAFE_RESOURCE_ALERT_BATCH_WINDOW_MS = Math.min(UPDATE_RESOURCE_ALERT_BATCH_WINDOW_MS, 15 * 1000);
 let batchQueue = new Map();
 let flushingPromise = null;
 let flushTimer = null;
 let flushDueAt = 0;
-let resolveFlushingPromise = null;
+let isExecutingFlush = false;
+let triggerEarlyFlush = null;
 let frontendSubscriberSnapshot = { checkedAt: 0, count: 0 };
 
 function normalizeTimestamp(value, fallback = Date.now()) {
@@ -92,10 +95,110 @@ function logUpdateBadRequest(reason, details = {}) {
 }
 
 function getDeclaredContentLength(request) {
-  const raw = request.headers.get('Content-Length');
-  if (!raw) return null;
+  const raw = request?.headers?.get?.('Content-Length');
+  if (raw === null || raw === undefined || String(raw).trim() === '') return null;
   const length = Number(raw);
   return Number.isFinite(length) && length >= 0 ? length : null;
+}
+
+export async function readBoundedJsonObject(request, maxBytes) {
+  const declaredLength = getDeclaredContentLength(request);
+  if (declaredLength !== null && declaredLength > maxBytes) {
+    try {
+      await request?.body?.cancel?.();
+    } catch (_) {}
+    return {
+      ok: false,
+      status: 413,
+      reason: 'payload_too_large',
+      declaredLength
+    };
+  }
+
+  let rawText = '';
+  if (request?.body && typeof request.body.getReader === 'function') {
+    const reader = request.body.getReader();
+    const chunks = [];
+    let totalBytes = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = value instanceof Uint8Array
+          ? value
+          : (ArrayBuffer.isView(value)
+            ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
+            : new TextEncoder().encode(String(value ?? '')));
+        totalBytes += chunk.byteLength;
+        if (totalBytes > maxBytes) {
+          try {
+            await reader.cancel();
+          } catch (_) {}
+          return {
+            ok: false,
+            status: 413,
+            reason: 'payload_too_large',
+            byteLength: totalBytes
+          };
+        }
+        chunks.push(chunk);
+      }
+    } catch (_) {
+      return { ok: false, status: 400, reason: 'body_read_failed' };
+    } finally {
+      try {
+        reader.releaseLock();
+      } catch (_) {}
+    }
+
+    const merged = new Uint8Array(totalBytes);
+    let offset = 0;
+    for (const chunk of chunks) {
+      merged.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    rawText = new TextDecoder('utf-8', { fatal: false }).decode(merged);
+  } else if (typeof request?.text === 'function') {
+    try {
+      rawText = await request.text();
+    } catch (_) {
+      return { ok: false, status: 400, reason: 'body_read_failed' };
+    }
+    const byteLength = new TextEncoder().encode(rawText).byteLength;
+    if (byteLength > maxBytes) {
+      return { ok: false, status: 413, reason: 'payload_too_large', byteLength };
+    }
+  } else if (typeof request?.json === 'function') {
+    let parsed;
+    try {
+      parsed = await request.json();
+    } catch (_) {
+      return { ok: false, status: 400, reason: 'invalid_json' };
+    }
+    const serialized = JSON.stringify(parsed);
+    if (serialized && new TextEncoder().encode(serialized).byteLength > maxBytes) {
+      return { ok: false, status: 413, reason: 'payload_too_large' };
+    }
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { ok: false, status: 400, reason: 'invalid_json_object' };
+    }
+    return { ok: true, data: parsed };
+  } else {
+    return { ok: false, status: 400, reason: 'invalid_json' };
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(rawText);
+  } catch (_) {
+    return { ok: false, status: 400, reason: 'invalid_json' };
+  }
+
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { ok: false, status: 400, reason: 'invalid_json_object' };
+  }
+
+  return { ok: true, data: parsed };
 }
 
 function createPayloadTooLargeResponse() {
@@ -350,13 +453,19 @@ export function toBroadcastSamples(id, samples, regionCode, agentVersion = '', r
   });
 }
 
-function queueBroadcastSamples(serverId, samples) {
+function queueBroadcastSamples(serverId, samples, options = {}) {
   if (!serverId || !Array.isArray(samples) || samples.length === 0) return;
   const existing = batchQueue.get(serverId);
   const merged = existing && Array.isArray(existing.samples)
     ? existing.samples.concat(samples)
     : samples;
-  batchQueue.set(serverId, { samples: merged.slice(-UPDATE_MAX_BATCH_SAMPLES) });
+  const isHidden = options.isHidden !== undefined
+    ? Boolean(options.isHidden)
+    : Boolean(existing?.isHidden);
+  batchQueue.set(serverId, {
+    samples: merged.slice(-UPDATE_MAX_BATCH_SAMPLES),
+    isHidden
+  });
 }
 
 async function getCachedFrontendSubscriberCount(env) {
@@ -434,7 +543,7 @@ async function getBatchFlushDelayMs(env, now = Date.now()) {
   try {
     const settings = await loadSiteSettings(env.DB);
     if (hasResourceAlertNotificationTarget(settings) && getResourceAlertConfig(settings).enabled) {
-      return UPDATE_RESOURCE_ALERT_BATCH_WINDOW_MS;
+      return SAFE_RESOURCE_ALERT_BATCH_WINDOW_MS;
     }
   } catch (e) {
     console.warn('[broadcast] failed to load batch delay settings:', e?.message || e);
@@ -494,11 +603,20 @@ async function _flushBatch(env) {
   const updates = [];
   for (const [serverId, item] of queue) {
     if (item && Array.isArray(item.samples) && item.samples.length > 0) {
-      updates.push({ serverId, samples: item.samples });
+      updates.push({
+        serverId,
+        samples: item.samples,
+        isHidden: item.isHidden === true
+      });
     } else if (item) {
       const filtered = Object.assign({}, item);
+      delete filtered.isHidden;
       BROADCAST_DELETE_FIELDS.forEach(field => delete filtered[field]);
-      updates.push({ serverId, payload: filtered });
+      updates.push({
+        serverId,
+        payload: filtered,
+        isHidden: item.isHidden === true
+      });
     }
   }
 
@@ -510,7 +628,7 @@ async function _flushBatch(env) {
 
     const id = env.METRICS_BROADCASTER.idFromName('global');
     const stub = env.METRICS_BROADCASTER.get(id);
-    await stub.fetch('http://internal/batch-push', {
+    const response = await stub.fetch('http://internal/batch-push', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -519,8 +637,75 @@ async function _flushBatch(env) {
         latestReportOnly: intent.latestReportOnly === true
       })
     });
+    if (response?.ok) {
+      try {
+        const respData = await response.json();
+        const subscribers = Math.max(0, Number(respData?.subscribers) || 0);
+        frontendSubscriberSnapshot = { checkedAt: Date.now(), count: subscribers };
+        if (subscribers > 0) {
+          markFrontendRealtimeActive();
+        }
+      } catch (_) {}
+    }
   } catch (e) {
     console.warn('[broadcast] batch push failed:', e.message || e);
+  }
+}
+
+function _waitFlushWindow(delayMs) {
+  return new Promise(resolve => {
+    const normalizedDelayMs = Math.max(0, Number(delayMs) || UPDATE_REALTIME_BATCH_WINDOW_MS);
+    flushDueAt = Date.now() + normalizedDelayMs;
+    const finish = () => {
+      if (flushTimer) {
+        clearTimeout(flushTimer);
+        flushTimer = null;
+      }
+      flushDueAt = 0;
+      triggerEarlyFlush = null;
+      resolve();
+    };
+    triggerEarlyFlush = finish;
+    flushTimer = setTimeout(finish, normalizedDelayMs);
+  });
+}
+
+// 统一在单个受 ctx.waitUntil 托管的 Promise 链内完成批等待与跟进冲刷，
+// 杜绝在 waitUntil Promise 提前 resolve 后裸起孤儿 setTimeout。
+async function _scheduleFollowUpFlush(env) {
+  const MAX_DRAIN_ROUNDS = 4;
+  let round = 0;
+  try {
+    while (batchQueue.size > 0 && round < MAX_DRAIN_ROUNDS) {
+      round++;
+      const delayMs = await getBatchFlushDelayMs(env, Date.now());
+      if (batchQueue.size === 0) break;
+      await _waitFlushWindow(delayMs);
+      if (batchQueue.size === 0) break;
+      isExecutingFlush = true;
+      try {
+        await _flushBatch(env);
+      } finally {
+        isExecutingFlush = false;
+      }
+    }
+    if (batchQueue.size > 0) {
+      isExecutingFlush = true;
+      try {
+        await _flushBatch(env);
+      } finally {
+        isExecutingFlush = false;
+      }
+    }
+  } finally {
+    flushingPromise = null;
+    isExecutingFlush = false;
+    flushDueAt = 0;
+    triggerEarlyFlush = null;
+    if (flushTimer) {
+      clearTimeout(flushTimer);
+      flushTimer = null;
+    }
   }
 }
 
@@ -528,41 +713,22 @@ function _ensureBatchFlush(env) {
   const now = Date.now();
   if (flushingPromise) {
     if (
+      !isExecutingFlush &&
+      flushTimer &&
       hasRecentFrontendRealtimeActivity(now) &&
       flushDueAt > now + UPDATE_REALTIME_BATCH_WINDOW_MS
     ) {
-      if (flushTimer) clearTimeout(flushTimer);
+      clearTimeout(flushTimer);
       flushDueAt = now + UPDATE_REALTIME_BATCH_WINDOW_MS;
+      const wake = triggerEarlyFlush;
       flushTimer = setTimeout(() => {
-        const resolve = resolveFlushingPromise;
-        flushTimer = null;
-        flushDueAt = 0;
-        resolveFlushingPromise = null;
-        _flushBatch(env).finally(() => {
-          flushingPromise = null;
-          if (resolve) resolve();
-        });
+        if (wake) wake();
       }, UPDATE_REALTIME_BATCH_WINDOW_MS);
     }
     return flushingPromise;
   }
 
-  flushingPromise = getBatchFlushDelayMs(env, now).then(delayMs => new Promise(resolve => {
-    resolveFlushingPromise = resolve;
-    const normalizedDelayMs = Math.max(0, Number(delayMs) || UPDATE_REALTIME_BATCH_WINDOW_MS);
-    flushDueAt = Date.now() + normalizedDelayMs;
-    flushTimer = setTimeout(() => {
-      const currentResolve = resolveFlushingPromise;
-      flushTimer = null;
-      flushDueAt = 0;
-      resolveFlushingPromise = null;
-      _flushBatch(env).finally(() => {
-        flushingPromise = null;
-        if (currentResolve) currentResolve();
-      });
-    }, normalizedDelayMs);
-  }));
-
+  flushingPromise = _scheduleFollowUpFlush(env);
   return flushingPromise;
 }
 
@@ -602,21 +768,26 @@ export async function handleUpdate(request, env, ctx) {
 
 async function handleUpdateCore(request, env, ctx, discovery, authState = null) {
   try {
-    // 必须在 request.json() 之前：超大 body 的解析本身就可能耗尽 Worker CPU。
-    // 注意这是防呆而非硬上限：chunked 或缺少 Content-Length 的请求会跳过该检查。
-    const declaredLength = getDeclaredContentLength(request);
-    if (declaredLength !== null && declaredLength > UPDATE_MAX_REQUEST_BYTES) {
-      console.warn('[Update] 413 Payload too large:', {
-        content_length: declaredLength,
-        limit: UPDATE_MAX_REQUEST_BYTES
-      });
-      return createPayloadTooLargeResponse();
+    // 必须在 JSON 解析前做 Content-Length 与流式字节上限检查，并强制校验普通对象。
+    const bodyResult = await readBoundedJsonObject(request, UPDATE_MAX_REQUEST_BYTES);
+    if (!bodyResult.ok) {
+      if (bodyResult.status === 413) {
+        console.warn('[Update] 413 Payload too large:', {
+          content_length: bodyResult.declaredLength ?? bodyResult.byteLength ?? null,
+          limit: UPDATE_MAX_REQUEST_BYTES
+        });
+        return createPayloadTooLargeResponse();
+      }
+      logUpdateBadRequest('Invalid JSON object', { reason: bodyResult.reason });
+      return createBadRequestResponse('Invalid JSON payload');
     }
 
-    const data = await request.json();
+    const data = bodyResult.data;
     const { id: requestedId, secret } = data;
 
-    if (secret !== env.API_SECRET) {
+    const providedSecret = typeof secret === 'string' ? secret : '';
+    const expectedSecret = typeof env.API_SECRET === 'string' ? env.API_SECRET : '';
+    if (!providedSecret || !expectedSecret || !timingSafeEqualString(providedSecret, expectedSecret)) {
       return createUnauthorizedResponse('Invalid secret');
     }
     if (authState) authState.ok = true;
@@ -722,7 +893,7 @@ async function handleUpdateCore(request, env, ctx, discovery, authState = null) 
     // 从缓存中获取历史记录分区 ID
     const historyPartitionId = serverDetail.history_partition_id;
     if(!historyPartitionId) {
-      await ensureServerOptimization(env.DB, id);
+      await ensureServerOptimization(env.DB, { forceServerId: id });
       logUpdateBadRequest('Missing history_partition_id', {
         id,
         history_partition_id: serverDetail.history_partition_id
@@ -730,8 +901,8 @@ async function handleUpdateCore(request, env, ctx, discovery, authState = null) 
       return createBadRequestResponse('Missing history_partition_id');
     }
 
-    const samples = normalizeMetricSamples(data);
-    if (samples.length === 0) {
+    const rawSamples = normalizeMetricSamples(data);
+    if (rawSamples.length === 0) {
       logUpdateBadRequest('Missing metrics', {
         id,
         has_metrics: !!data.metrics,
@@ -740,6 +911,14 @@ async function handleUpdateCore(request, env, ctx, discovery, authState = null) 
       });
       return createBadRequestResponse('Missing metrics');
     }
+
+    // 钳制远古/未来漂移时间戳，防止 buildHistoryId 抛错或污染最新上报窗口
+    const serverNow = Date.now();
+    const samples = rawSamples.map(sample => ({
+      ...sample,
+      ts: clampMetricTimestamp(sample.ts, serverNow)
+    }));
+    samples.sort((a, b) => a.ts - b.ts);
 
     // 获取最后一条插入（如果是批量数据，取最后一个样本）
     const latestSample = samples[samples.length - 1];
@@ -755,15 +934,19 @@ async function handleUpdateCore(request, env, ctx, discovery, authState = null) 
       agentVersion
     );
 
+    const isHidden = String(serverDetail?.is_hidden || '0') === '1';
     const broadcastSamples = toBroadcastSamples(id, samples, regionCode, agentVersion, latestMetrics);
-    cacheLatestReportUpdate(id, broadcastSamples, Date.now());
+    cacheLatestReportUpdate(id, broadcastSamples, serverNow);
     // 加入批量队列，由后台定时任务统一推送到 DO
-    queueBroadcastSamples(id, broadcastSamples);
-    ctx.waitUntil(_ensureBatchFlush(env));
-    // 月流量阈值告警：复用已加载的 serverDetail 与刚入库的 historyMetrics，非阻塞后台执行
-    ctx.waitUntil(evaluateTrafficAlert(env, serverDetail, historyMetrics, {
-      patchCache: (serverId, value) => patchServerDetailCache(serverId, { traffic_alert_state: value })
-    }));
+    queueBroadcastSamples(id, broadcastSamples, { isHidden });
+    if (ctx && typeof ctx.waitUntil === 'function') {
+      ctx.waitUntil(_ensureBatchFlush(env));
+      // 月流量阈值告警：复用已加载的 serverDetail 与刚入库的 historyMetrics，非阻塞后台执行
+      ctx.waitUntil(evaluateTrafficAlert(env, serverDetail, historyMetrics, {
+        patchCache: (serverId, value) => patchServerDetailCache(serverId, { traffic_alert_state: value }),
+        invalidateCache: (sid) => clearServerDetailCache(sid)
+      }));
+    }
 
     const clientConfigSchema = normalizeAgentConfigSchemaVersion(request.headers.get(AGENT_CONFIG_SCHEMA_HEADER));
     if (!clientConfigSchema) {
@@ -822,7 +1005,7 @@ function isWebSocketUpgradeRequest(request) {
   return !!upgradeHeader && upgradeHeader.toLowerCase() === 'websocket';
 }
 
-async function forwardWebSocketUpgrade(request, env, internalPath, logPrefix) {
+async function forwardWebSocketUpgrade(request, env, internalPath, logPrefix, options = {}) {
   if (!env || !env.METRICS_BROADCASTER) {
     return new Response(JSON.stringify({ error: 'WebSocket not enabled', code: 503 }), {
       status: 503,
@@ -841,6 +1024,11 @@ async function forwardWebSocketUpgrade(request, env, internalPath, logPrefix) {
     const stub = env.METRICS_BROADCASTER.get(id);
     const realOrigin = new URL(request.url).origin;
     const headers = new Headers(request.headers);
+    // 先剥离客户端可能伪造的内部管理员身份头，再由服务端可信写入
+    headers.delete('X-CFSM-Admin');
+    if (internalPath === '/ws' || options.isAdmin !== undefined) {
+      headers.set('X-CFSM-Admin', options.isAdmin ? '1' : '0');
+    }
     headers.set('X-Real-Origin', realOrigin);
     if (request.cf?.country && !headers.get('cf-ipcountry')) {
       headers.set('cf-ipcountry', request.cf.country);
@@ -862,14 +1050,15 @@ async function forwardWebSocketUpgrade(request, env, internalPath, logPrefix) {
 
 export async function handleWebSocketUpgrade(request, env) {
   const settings = await loadSiteSettings(env.DB, { forceRefresh: true });
-  if (settings?.is_public !== 'true' && !await checkWebSocketAuth(request, env, settings)) {
+  const isAdmin = await checkWebSocketAuth(request, env, settings);
+  if (settings?.is_public !== 'true' && !isAdmin) {
     return new Response(JSON.stringify({ error: 'Unauthorized', code: 401 }), {
       status: 401,
       headers: { 'Content-Type': 'application/json' }
     });
   }
 
-  const response = await forwardWebSocketUpgrade(request, env, '/ws', '[ws]');
+  const response = await forwardWebSocketUpgrade(request, env, '/ws', '[ws]', { isAdmin });
   if (response?.status === 101) {
     markFrontendRealtimeActive();
   }

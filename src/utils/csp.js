@@ -101,8 +101,20 @@ export function injectApiBase(html, apiBases) {
   return `${meta}\n${html}`;
 }
 
-function escapeCssUrl(value) {
-  return String(value).replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '\\"');
+const CSS_URL_HEX_ESCAPE_MAP = Object.freeze({
+  '\\': '\\5c ',
+  "'": '\\27 ',
+  '"': '\\22 ',
+  '(': '\\28 ',
+  ')': '\\29 ',
+  '<': '\\3c ',
+  '>': '\\3e '
+});
+
+export function escapeCssUrl(value) {
+  return String(value ?? '')
+    .replace(/[\u0000-\u001f\u007f]/g, '')
+    .replace(/[\\'"()<>]/g, ch => CSS_URL_HEX_ESCAPE_MAP[ch]);
 }
 
 function buildBodyBackgroundRule(safeUrl) {

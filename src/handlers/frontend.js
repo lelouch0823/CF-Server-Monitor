@@ -17,6 +17,7 @@ import { checkAuth } from '../middleware/auth.js';
 const IMMUTABLE_ASSET_CACHE_CONTROL = 'public, max-age=31536000, immutable';
 const PREVIEW_COOKIE = 'cfsm_theme_preview';
 const PREVIEW_AUTH_COOKIE = 'cfsm_theme_preview_auth';
+const THEME_UPSTREAM_FETCH_TIMEOUT_MS = 8000;
 
 let filesCache = null;
 
@@ -345,9 +346,22 @@ async function fetchWithCache(rawUrl, contentType, workerCacheUrl, workerCacheTt
     }
   }
 
-  const originResponse = await fetch(rawUrl, {
-    headers: { 'User-Agent': 'CFSM-Theme-Proxy' }
-  });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), THEME_UPSTREAM_FETCH_TIMEOUT_MS);
+  let originResponse;
+  try {
+    originResponse = await fetch(rawUrl, {
+      headers: { 'User-Agent': 'CFSM-Theme-Proxy' },
+      signal: controller.signal
+    });
+  } catch (_) {
+    return new Response('Theme upstream request failed', {
+      status: 504,
+      headers: { 'Content-Type': 'text/plain;charset=UTF-8' }
+    });
+  } finally {
+    clearTimeout(timeoutId);
+  }
 
   if (!originResponse.ok) {
     return new Response('Theme file not found', {

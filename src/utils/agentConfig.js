@@ -155,18 +155,12 @@ export function validatePingNode(value) {
     return { valid: false };
   }
 
-  if (raw.startsWith('[')) {
-    const match = raw.match(/^\[([^\]]+)\](?::(\d{1,5}))?$/);
-    if (!match || !isValidIpv6(match[1])) return { valid: false };
-    const port = match[2] ? Number(match[2]) : null;
-    if (port !== null && (port < 1 || port > 65535)) return { valid: false };
-    return { valid: true, value: `[${match[1].toLowerCase()}]${port !== null ? `:${port}` : ''}` };
-  }
-
+  // 所有平台的探针（shell/Windows）都无法解析含多冒号的 IPv6 目标，
+  // 配置后只会表现为永久 null 延迟 + 100% 丢包，这里直接拒绝并在
+  // 存量数据下发生配置时由 sanitizePingNode 置空（探针显示为未启用）
   const colonCount = (raw.match(/:/g) || []).length;
-  if (colonCount > 1) {
-    const host = raw.toLowerCase();
-    return isValidIpv6(host) ? { valid: true, value: `[${host}]` } : { valid: false };
+  if (raw.startsWith('[') || colonCount > 1) {
+    return { valid: false };
   }
 
   let host = raw;

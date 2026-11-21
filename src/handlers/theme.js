@@ -20,15 +20,21 @@ const normalizeThemeStore = (data) => {
   return createEmptyThemeStore()
 }
 
+const THEME_STORE_FETCH_TIMEOUT_MS = 8000
+
 export async function handleTheme() {
   const now = Math.floor(Date.now() / 1000)
   if (cachedThemeStore && (now - cacheTime) < THEME_STORE_CACHE_TTL_SECONDS) {
     return { ok: true, themeStore: cachedThemeStore, cached: true }
   }
 
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), THEME_STORE_FETCH_TIMEOUT_MS)
+
   try {
     const res = await fetch(THEME_STORE_URL, {
-      headers: { 'User-Agent': 'CFSM-Theme-Store' }
+      headers: { 'User-Agent': 'CFSM-Theme-Store' },
+      signal: controller.signal
     })
 
     if (!res.ok) {
@@ -43,5 +49,7 @@ export async function handleTheme() {
     return { ok: true, themeStore, cached: false }
   } catch (e) {
     return { ok: false, status: 0, error: 'themeStoreProxyFailed' }
+  } finally {
+    clearTimeout(timeoutId)
   }
 }

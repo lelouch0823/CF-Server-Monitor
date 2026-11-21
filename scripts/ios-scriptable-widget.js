@@ -6,11 +6,11 @@
 // Put multiple widget instances in an iOS widget stack, each with a different server id, to swipe between servers.
 
 const CONFIG = {
-  baseURL: "https://www.exmaple.com", //必填
+  baseURL: "https://www.example.com", //必填（仅支持 https://，未修改占位值时运行会提示先配置 baseURL）
   serverId: "" //必填，也可以在widgetParameter中指定
 };
 
-CONFIG.baseURL = String(CONFIG.baseURL || "").replace(/\/+$/, "");
+CONFIG.baseURL = String(CONFIG.baseURL || "").trim().replace(/\/+$/, "");
 
 const family = config.widgetFamily || "medium";
 const widgetParameter = String(args.widgetParameter || "").trim();
@@ -28,6 +28,12 @@ const COL = {
   track: new Color("#ffffff", 0.12)
 };
 
+function isValidHttpsBaseUrl(value) {
+  const raw = String(value || "").trim();
+  if (!/^https:\/\/[^\s/$.?#].[^\s]*$/i.test(raw)) return false;
+  return !/(?:^|\/\/|\.)example\.com(?:$|[/:?#])/i.test(raw);
+}
+
 function normalizeServerId(value) {
   const raw = String(value || "").trim();
   const matched = raw.match(/^(?:id|server):(.+)$/i);
@@ -42,17 +48,22 @@ function requiredServerId() {
 function getFlagRegionCode(region) {
   const code = String(region || "").trim().toUpperCase();
   if (!code || code === "XX") return "";
-  if (code === "TW" || code === "HK" || code === "MO") return "cn";
-  return code.toLowerCase();
+  const normalized = (code === "TW" || code === "HK" || code === "MO") ? "cn" : code.toLowerCase();
+  return /^[a-z]{2}$/.test(normalized) ? normalized : "";
 }
 
 async function fetchFlagImage(region) {
   const code = getFlagRegionCode(region);
-  if (!code) return null;
+  if (!/^[a-z]{2}$/.test(code)) return null;
   try {
     const req = new Request(`https://flagcdn.com/24x18/${code}.png`);
     req.timeoutInterval = 5;
-    return await req.loadImage();
+    const img = await req.loadImage();
+    const statusCode = Number(req.response && req.response.statusCode);
+    if (Number.isFinite(statusCode) && statusCode > 0 && (statusCode < 200 || statusCode >= 300)) {
+      return null;
+    }
+    return img;
   } catch (e) {
     return null;
   }
@@ -130,9 +141,21 @@ function hhmm() {
 }
 
 async function fetchJSON(path) {
+  if (!/^https:\/\//i.test(CONFIG.baseURL)) {
+    throw new Error("CONFIG.baseURL must use https://");
+  }
   const req = new Request(CONFIG.baseURL + path);
   req.timeoutInterval = 15;
-  return await req.loadJSON();
+  const body = await req.loadString();
+  const statusCode = Number(req.response && req.response.statusCode);
+  if (!Number.isFinite(statusCode) || statusCode < 200 || statusCode >= 300) {
+    throw new Error(`HTTP ${Number.isFinite(statusCode) && statusCode > 0 ? statusCode : "error"}`);
+  }
+  try {
+    return JSON.parse(body);
+  } catch (e) {
+    throw new Error("Invalid JSON response");
+  }
 }
 
 async function fetchServer(id) {
@@ -166,7 +189,7 @@ function baseWidget() {
   bg.colors = [COL.bg1, COL.bg2];
   bg.locations = [0, 1];
   w.backgroundGradient = bg;
-  if (CONFIG.baseURL) w.url = CONFIG.baseURL;
+  if (isValidHttpsBaseUrl(CONFIG.baseURL)) w.url = CONFIG.baseURL;
   w.refreshAfterDate = new Date(Date.now() + 60 * 1000);
   return w;
 }
@@ -242,48 +265,12 @@ function addFlag(parent, server, width, height) {
   }
 
   if (server._flagRegionCode) {
-    const region = addText(parent, String(server.region || "").toUpperCase(), Font.semiboldSystemFont(9), COL.dim, 1);
+    const region = addText(parent, server._flagRegionCode.toUpperCase(), Font.semiboldSystemFont(9), COL.dim, 1);
     region.minimumScaleFactor = 0.7;
     return true;
   }
 
   return false;
-}
-
-function addServerRow(widget, server, large) {
-  const online = isOnline(server);
-  const cpu = Number(server.cpu) || 0;
-  const ram = percent(server.ram_used, server.ram_total);
-  const disk = percent(server.disk_used, server.disk_total);
-  const traffic = trafficPercent(server);
-
-  const head = widget.addStack();
-  head.centerAlignContent();
-  addText(head, "●", Font.systemFont(9), online ? COL.green : COL.dim2, 1);
-  head.addSpacer(5);
-  if (addFlag(head, server, 20, 15)) head.addSpacer(5);
-  const name = addText(head, serverName(server), Font.semiboldSystemFont(large ? 13 : 12), COL.fg, 1);
-  name.minimumScaleFactor = 0.75;
-  head.addSpacer();
-  const status = online
-    ? `↓ ${formatBytes(server.net_in_speed)}/s  ↑ ${formatBytes(server.net_out_speed)}/s`
-    : "offline";
-  const st = addText(head, status, Font.systemFont(large ? 10 : 9), online ? COL.dim : COL.red, 1);
-  st.minimumScaleFactor = 0.7;
-
-  widget.addSpacer(5);
-  const metrics = widget.addStack();
-  metrics.layoutHorizontally();
-  addMetricColumn(metrics, "CPU", cpu, large ? 86 : 76);
-  metrics.addSpacer(8);
-  addMetricColumn(metrics, "RAM", ram, large ? 86 : 76);
-  metrics.addSpacer(8);
-  addMetricColumn(metrics, "DISK", disk, large ? 86 : 76);
-
-  if (server.traffic_limit) {
-    widget.addSpacer(5);
-    addBar(widget, "TRF", traffic, large ? 245 : 216, 6);
-  }
 }
 
 function addSmallServer(widget, server) {
@@ -360,7 +347,7 @@ function addSingleServer(widget, server, large, small) {
   metrics.addSpacer(8);
   addMetricColumn(metrics, "DISK", disk, large ? 86 : 76);
 
-  if (server.traffic_limit) {
+  if (trafficLimitBytes(server.traffic_limit) > 0) {
     widget.addSpacer(large ? 13 : 10);
     addBar(widget, "TRF", traffic, large ? 245 : 216, 7);
   }
@@ -402,8 +389,10 @@ function errWidget(message) {
 async function main() {
   let widget;
   try {
-    if (!CONFIG.baseURL || CONFIG.baseURL.includes("example.com")) {
+    if (!CONFIG.baseURL || /(?:^|\/\/|\.)example\.com(?:$|[/:?#])/i.test(CONFIG.baseURL)) {
       widget = errWidget("Set CONFIG.baseURL first.");
+    } else if (!isValidHttpsBaseUrl(CONFIG.baseURL)) {
+      widget = errWidget("CONFIG.baseURL must start with https://");
     } else {
       const data = await loadServers();
       widget = buildWidget(data);

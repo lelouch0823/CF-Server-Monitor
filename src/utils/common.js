@@ -68,21 +68,47 @@ function hexToBytes(hex) {
   return bytes;
 }
 
+const TIMING_SAFE_BLOCK_BYTES = 64;
+const SHARED_TEXT_ENCODER = new TextEncoder();
+
+function padBytesToBlock(bytes, targetLength) {
+  const padded = new Uint8Array(targetLength);
+  padded.set(bytes, 0);
+  return padded;
+}
+
 function timingSafeEqualBytes(left, right) {
   if (!(left instanceof Uint8Array) || !(right instanceof Uint8Array)) {
     return false;
   }
 
-  if (left.length === right.length && crypto.subtle && typeof crypto.subtle.timingSafeEqual === 'function') {
-    return crypto.subtle.timingSafeEqual(left, right);
-  }
+  const maxLength = Math.max(left.length, right.length, TIMING_SAFE_BLOCK_BYTES);
+  const blockLength = Math.ceil(maxLength / TIMING_SAFE_BLOCK_BYTES) * TIMING_SAFE_BLOCK_BYTES;
+  const paddedLeft = padBytesToBlock(left, blockLength);
+  const paddedRight = padBytesToBlock(right, blockLength);
 
   let diff = left.length ^ right.length;
-  const maxLength = Math.max(left.length, right.length);
-  for (let i = 0; i < maxLength; i++) {
-    diff |= (left[i] || 0) ^ (right[i] || 0);
+  if (crypto.subtle && typeof crypto.subtle.timingSafeEqual === 'function') {
+    const samePadded = crypto.subtle.timingSafeEqual(paddedLeft, paddedRight);
+    diff |= samePadded ? 0 : 1;
+  } else {
+    for (let i = 0; i < blockLength; i++) {
+      diff |= paddedLeft[i] ^ paddedRight[i];
+    }
   }
   return diff === 0;
+}
+
+/**
+ * 恒定时间字符串比较，用于共享密钥/用户名等敏感凭据比较，
+ * 避免原生字符串比较的首字节提前返回或长度不等分支造成时序侧信道
+ */
+export function timingSafeEqualString(left, right) {
+  const validTypes = typeof left === 'string' && typeof right === 'string';
+  const leftBytes = SHARED_TEXT_ENCODER.encode(typeof left === 'string' ? left : '');
+  const rightBytes = SHARED_TEXT_ENCODER.encode(typeof right === 'string' ? right : '');
+  const equal = timingSafeEqualBytes(leftBytes, rightBytes);
+  return validTypes && equal;
 }
 
 async function derivePbkdf2Hash(password, salt, iterations) {

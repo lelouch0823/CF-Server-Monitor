@@ -85,58 +85,215 @@ const CYCLE_ALIASES = new Map([
 ]);
 
 const NORMALIZED_CURRENCIES = new Set(CURRENCY_OPTIONS.map(item => item.symbol));
+const MULTI_CHAR_CURRENCIES_SORTED = Object.freeze(
+  CURRENCY_OPTIONS
+    .filter(item => item.symbol.length > 1)
+    .sort((a, b) => b.symbol.length - a.symbol.length)
+);
+const MULTI_CHAR_SYMBOL_ONLY_CURRENCIES = Object.freeze(
+  MULTI_CHAR_CURRENCIES_SORTED.filter(item => !/^[A-Za-z]+$/.test(item.symbol))
+);
+const SINGLE_CHAR_NON_ALPHA_CURRENCIES = Object.freeze(
+  CURRENCY_OPTIONS.filter(item => item.symbol.length === 1 && !/^[A-Za-z]$/.test(item.symbol))
+);
+const CURRENCY_CODE_MAP = new Map([
+  ['USD', '$'], ['US$', '$'],
+  ['CNY', '¥'], ['RMB', '¥'], ['CNH', '¥'],
+  ['EUR', '€'],
+  ['GBP', '£'],
+  ['JPY', '¥JPY'], ['JP¥', '¥JPY'],
+  ['HKD', 'HK$'],
+  ['AUD', 'A$'], ['AU$', 'A$'],
+  ['CAD', 'C$'], ['CA$', 'C$'],
+  ['SGD', 'S$'], ['SG$', 'S$'],
+  ['NZD', 'NZ$'],
+  ['CHF', '₣'],
+  ['KRW', '₩'],
+  ['INR', '₹'],
+  ['THB', '฿'],
+  ['VND', '₫'],
+  ['PHP', '₱'],
+  ['IDR', 'Rp'], ['RP', 'Rp'],
+  ['MYR', 'RM'], ['RM', 'RM'],
+  ['TRY', '₺'],
+  ['ILS', '₪'],
+  ['BDT', '৳'],
+  ['PKR', '₨'],
+  ['LKR', 'LKR'],
+  ['MNT', '₮'],
+  ['RUB', '₽'],
+  ['BRL', 'R$'],
+  ['SEK', 'kr'], ['NOK', 'kr'], ['DKK', 'kr'], ['ISK', 'kr'], ['KR', 'kr'],
+  ['PLN', 'zł'], ['ZL', 'zł'],
+  ['UAH', '₴'],
+  ['KZT', '₸'],
+  ['ZAR', 'R'],
+  ['NGN', '₦'],
+  ['EGP', 'EGP'],
+  ['AED', 'د.إ'],
+  ['SAR', '﷼'],
+  ['GTQ', 'Q']
+]);
+const DETECT_CODE_REGEX = /(?:^|[^A-Za-z])(USD|CNY|RMB|CNH|EUR|GBP|JPY|HKD|AUD|CAD|SGD|NZD|CHF|KRW|INR|THB|VND|PHP|IDR|MYR|RM|TRY|ILS|BDT|PKR|LKR|MNT|RUB|BRL|SEK|NOK|DKK|ISK|PLN|UAH|KZT|ZAR|NGN|EGP|AED|SAR|GTQ|Rp|kr)(?![A-Za-z])/i;
+const MAX_NORMALIZED_PRICE = 1e12;
+
+function normalizePriceNumberString(numberText) {
+  let mantissa = numberText;
+  let exponentSuffix = '';
+  const expMatch = numberText.match(/^(.+?)([eE][+-]?\d+)$/);
+  if (expMatch) {
+    mantissa = expMatch[1];
+    exponentSuffix = expMatch[2];
+  }
+
+  const hasComma = mantissa.includes(',');
+  const hasDot = mantissa.includes('.');
+
+  if (hasComma && hasDot) {
+    const lastComma = mantissa.lastIndexOf(',');
+    const lastDot = mantissa.lastIndexOf('.');
+    if (lastComma > lastDot) {
+      // European format with thousands dot and decimal comma, e.g. "1.234,56"
+      return mantissa.replace(/\./g, '').replace(',', '.') + exponentSuffix;
+    }
+    // Standard thousands comma and decimal dot, e.g. "1,234.56"
+    return mantissa.replace(/,/g, '') + exponentSuffix;
+  }
+
+  if (hasComma) {
+    const parts = mantissa.split(',');
+    // Single comma followed by 1 or 2 digits is European decimal, e.g. "40,50" or "-0,99"
+    if (parts.length === 2 && /^\d{1,2}$/.test(parts[1])) {
+      return `${parts[0]}.${parts[1]}${exponentSuffix}`;
+    }
+    return mantissa.replace(/,/g, '') + exponentSuffix;
+  }
+
+  if (hasDot) {
+    const parts = mantissa.split('.');
+    if (parts.length > 2) {
+      const integerParts = parts.slice(0, -1);
+      const lastPart = parts[parts.length - 1];
+      if (lastPart.length === 3 && integerParts.slice(1).every(p => p.length === 3)) {
+        return parts.join('') + exponentSuffix;
+      }
+      return `${integerParts.join('')}.${lastPart}${exponentSuffix}`;
+    }
+  }
+
+  return mantissa + exponentSuffix;
+}
 
 export function normalizePrice(value) {
-  if (value === null || value === undefined) return '';
+  if (value === null || value === undefined || typeof value === 'object' || typeof value === 'boolean') {
+    return '';
+  }
+
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) return '';
+    if (value === -1) return '-1';
+    if (value < 0) return '';
+    return Math.min(value, MAX_NORMALIZED_PRICE).toFixed(2);
+  }
 
   const raw = String(value).trim();
   if (!raw) return '';
 
-  const numberText = raw.match(/-?[\d.,]+/)?.[0];
+  // Match a numeric token starting with an optional minus and at least one digit,
+  // avoiding standalone dots/commas in prefixes such as "Rp. 50000" or "CHF. 15.00".
+  const numberText = raw.match(/-?\d+(?:[.,]\d+)*(?:[eE][+-]?\d+)?/)?.[0];
   if (!numberText) return '';
 
-  const normalized = numberText.replace(/,/g, '');
+  const normalized = normalizePriceNumberString(numberText);
   const num = Number.parseFloat(normalized);
   if (!Number.isFinite(num)) return '';
   if (num === -1) return '-1';
   if (num < 0) return '';
 
-  return num.toFixed(2);
+  return Math.min(num, MAX_NORMALIZED_PRICE).toFixed(2);
 }
 
 export function normalizeCurrency(value) {
-  const raw = String(value || '').trim();
+  if (value === null || value === undefined || typeof value === 'object' || typeof value === 'boolean') {
+    return '';
+  }
+  const raw = String(value).trim();
   if (!raw) return '';
 
-  // Normalize common variants
   const normalized = raw === '￥' ? '¥' : raw;
+  if (NORMALIZED_CURRENCIES.has(normalized)) {
+    return normalized;
+  }
 
-  // Try matching multi-char symbols first (HK$, A$, C$, S$, NZ$, R$, RM, zł)
-  for (const item of CURRENCY_OPTIONS) {
-    if (item.symbol.length > 1 && normalized.startsWith(item.symbol)) {
+  const strippedCode = normalized.replace(/\.$/, '').trim().toUpperCase();
+  if (CURRENCY_CODE_MAP.has(strippedCode)) {
+    return CURRENCY_CODE_MAP.get(strippedCode);
+  }
+
+  // Try matching multi-char symbols first (¥JPY, NZ$, HK$, A$, C$, S$, R$, RM, Rp, zł, kr, LKR, EGP)
+  for (const item of MULTI_CHAR_CURRENCIES_SORTED) {
+    if (normalized.startsWith(item.symbol)) {
+      if (/^[A-Za-z]+$/.test(item.symbol)) {
+        const nextChar = normalized[item.symbol.length] || '';
+        if (/[A-Za-z]/.test(nextChar)) continue;
+      }
       return item.symbol;
     }
   }
 
-  // Fallback to single-char match
-  const symbol = normalized[0];
-  return NORMALIZED_CURRENCIES.has(symbol) ? symbol : '';
+  // Leading ISO currency code followed by non-letter (e.g. "RMB 50", "RUB 100", "CHF. 15")
+  const codePrefixMatch = normalized.match(/^([A-Za-z]{2,3})(?![A-Za-z])/);
+  if (codePrefixMatch) {
+    const mapped = CURRENCY_CODE_MAP.get(codePrefixMatch[1].toUpperCase());
+    if (mapped) return mapped;
+  }
+
+  const firstChar = normalized[0];
+  if (!NORMALIZED_CURRENCIES.has(firstChar)) return '';
+
+  // Single-letter currency symbols ('R', 'Q') must not match arbitrary words like "Quarter" or "RUB"
+  if (/^[A-Za-z]$/.test(firstChar)) {
+    return /^[RQ](?:\s*\.?\s*\d|$)/.test(normalized) ? firstChar : '';
+  }
+
+  return firstChar;
 }
 
 export function detectCurrencySymbol(value) {
-  const raw = String(value || '');
+  if (value === null || value === undefined || typeof value === 'object' || typeof value === 'boolean') {
+    return '';
+  }
+  const raw = String(value);
   if (!raw) return '';
   if (raw.includes('￥')) return '¥';
 
-  // Try matching multi-char symbols first (HK$, A$, C$, S$, NZ$, R$, RM, zł)
-  for (const item of CURRENCY_OPTIONS) {
-    if (item.symbol.length > 1 && raw.includes(item.symbol)) {
+  // 1) Multi-char symbols with non-alpha currency glyphs (¥JPY, HK$, NZ$, A$, C$, S$, R$, zł, د.إ)
+  for (const item of MULTI_CHAR_SYMBOL_ONLY_CURRENCIES) {
+    if (raw.includes(item.symbol)) {
       return item.symbol;
     }
   }
 
-  // Fallback to single-char match
-  return CURRENCY_OPTIONS.find(item => item.symbol.length === 1 && raw.includes(item.symbol))?.symbol || '';
+  // 2) Exact ISO currency codes / multi-letter currency tokens with word boundaries
+  const codeMatch = raw.match(DETECT_CODE_REGEX);
+  if (codeMatch) {
+    const mapped = CURRENCY_CODE_MAP.get(codeMatch[1].toUpperCase());
+    if (mapped) return mapped;
+  }
+
+  // 3) Single-char non-alphabetic currency glyphs ($, ¥, €, £, ₽, ₩, ₹, etc.)
+  const glyphMatch = SINGLE_CHAR_NON_ALPHA_CURRENCIES.find(item => raw.includes(item.symbol));
+  if (glyphMatch) {
+    return glyphMatch.symbol;
+  }
+
+  // 4) Single-letter currency symbols ('R', 'Q') only when used as an explicit prefix before digits
+  const singleAlphaMatch = raw.match(/(?:^|[\s(])([RQ])\s*(?=\d)/);
+  if (singleAlphaMatch && NORMALIZED_CURRENCIES.has(singleAlphaMatch[1])) {
+    return singleAlphaMatch[1];
+  }
+
+  return '';
 }
 
 export function detectBillingCycle(value) {
@@ -174,7 +331,7 @@ export function isEnabledFlag(value) {
   return value === true || value === 1 || value === '1' || value === 'true';
 }
 
-function parseDateOnly(value) {
+export function parseDateOnly(value) {
   const match = String(value || '').trim().match(/^(\d{4})-(\d{2})-(\d{2})$/);
   if (!match) return null;
 
@@ -206,17 +363,21 @@ function toDateString(year, month, day) {
   ].join('-');
 }
 
+function addMonthsToParsedDate(initialParsed, monthsToAdd) {
+  const zeroBasedMonth = initialParsed.month - 1 + monthsToAdd;
+  const year = initialParsed.year + Math.floor(zeroBasedMonth / 12);
+  const month = ((zeroBasedMonth % 12) + 12) % 12 + 1;
+  const day = Math.min(initialParsed.day, daysInUtcMonth(year, month));
+
+  return toDateString(year, month, day);
+}
+
 function addBillingCycleToDate(dateString, billingCycle) {
   const parsed = parseDateOnly(dateString);
   if (!parsed) return String(dateString || '').trim();
 
   const monthsToAdd = getBillingCycleOption(billingCycle).months;
-  const zeroBasedMonth = parsed.month - 1 + monthsToAdd;
-  const year = parsed.year + Math.floor(zeroBasedMonth / 12);
-  const month = ((zeroBasedMonth % 12) + 12) % 12 + 1;
-  const day = Math.min(parsed.day, daysInUtcMonth(year, month));
-
-  return toDateString(year, month, day);
+  return addMonthsToParsedDate(parsed, monthsToAdd);
 }
 
 function utcDateStringWithOffset(now = Date.now(), offsetDays = 0) {
@@ -224,21 +385,32 @@ function utcDateStringWithOffset(now = Date.now(), offsetDays = 0) {
   return toDateString(date.getUTCFullYear(), date.getUTCMonth() + 1, date.getUTCDate());
 }
 
-export function renewExpireDateIfNeeded(expireDate, billingCycle, autoRenewal, now = Date.now(), renewBeforeDays = 0) {
+function dateStringWithOffsetFromReference(referenceDateStr, offsetDays = 0) {
+  const parsed = parseDateOnly(referenceDateStr);
+  if (!parsed) return null;
+  const ts = Date.UTC(parsed.year, parsed.month - 1, parsed.day) + (Number(offsetDays) || 0) * 86400000;
+  const date = new Date(ts);
+  return toDateString(date.getUTCFullYear(), date.getUTCMonth() + 1, date.getUTCDate());
+}
+
+export function renewExpireDateIfNeeded(expireDate, billingCycle, autoRenewal, now = Date.now(), renewBeforeDays = 0, options = {}) {
   const original = String(expireDate || '').trim();
-  if (!original || !parseDateOnly(original) || !isEnabledFlag(autoRenewal)) {
+  const initialParsed = parseDateOnly(original);
+  if (!original || !initialParsed || !isEnabledFlag(autoRenewal)) {
     return { expire_date: original, renewed: false };
   }
 
+  const monthsPerCycle = getBillingCycleOption(billingCycle).months;
   let nextDate = original;
-  const renewalDate = utcDateStringWithOffset(now, renewBeforeDays);
+  const renewalDate = (options?.referenceDateStr && dateStringWithOffsetFromReference(options.referenceDateStr, renewBeforeDays)) ||
+    utcDateStringWithOffset(now, renewBeforeDays);
   let renewed = false;
-  let guard = 0;
+  let step = 0;
 
-  while (nextDate <= renewalDate && guard < 1200) {
-    nextDate = addBillingCycleToDate(nextDate, billingCycle);
+  while (nextDate <= renewalDate && step < 1200) {
+    step++;
+    nextDate = addMonthsToParsedDate(initialParsed, monthsPerCycle * step);
     renewed = true;
-    guard++;
   }
 
   return { expire_date: nextDate, renewed };

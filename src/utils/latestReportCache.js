@@ -91,3 +91,17 @@ export function getWorkerLatestReportUpdates(serverIds, now = Date.now()) {
 export function getLatestReportSampleTimestamp(update) {
   return getLatestSampleTimestamp(update?.samples);
 }
+
+export function clearLatestReportCache(serverIds = null) {
+  if (serverIds === null || serverIds === undefined) {
+    latestReportUpdates.clear();
+    return;
+  }
+
+  const list = Array.isArray(serverIds) ? serverIds : [serverIds];
+  for (const id of list) {
+    if (id !== null && id !== undefined) {
+      latestReportUpdates.delete(String(id));
+    }
+  }
+}

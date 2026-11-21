@@ -220,12 +220,13 @@ assert.equal(buildAgentConfig({ custom_ct: 'GD-CT-V4.IP.ZSTATICCDN.COM:080' }).c
 assert.equal(buildAgentConfig({ custom_ct: 'a'.repeat(100) }).custom_ct, '');
 assert.equal(buildAgentConfig({ custom_ct: 'gd-ct-v4.ip.zstaticcdn.com:99999' }).custom_ct, '');
 assert.equal(buildAgentConfig({ custom_ct: 'foo:bar' }).custom_ct, '');
-assert.equal(buildAgentConfig({ custom_ct: '2001:db8::1' }).custom_ct, '[2001:db8::1]');
-assert.equal(buildAgentConfig({ custom_ct: '[2001:db8::1]:443' }).custom_ct, '[2001:db8::1]:443');
+// IPv6 目标：所有探针平台均不支持解析，服务端拒绝配置、存量数据下发时置空
+assert.equal(buildAgentConfig({ custom_ct: '2001:db8::1' }).custom_ct, '');
+assert.equal(buildAgentConfig({ custom_ct: '[2001:db8::1]:443' }).custom_ct, '');
 assert.deepEqual(validatePingNode('foo:443'), { valid: true, value: 'foo:443' });
 assert.equal(validatePingNode('foo:bar').valid, false);
-assert.deepEqual(validatePingNode('2001:db8::1'), { valid: true, value: '[2001:db8::1]' });
-assert.deepEqual(validatePingNode('[2001:db8::1]:443'), { valid: true, value: '[2001:db8::1]:443' });
-assert.deepEqual(validatePingNode('2001:db8::1:443'), { valid: true, value: '[2001:db8::1:443]' });
+assert.equal(validatePingNode('2001:db8::1').valid, false);
+assert.equal(validatePingNode('[2001:db8::1]:443').valid, false);
+assert.equal(validatePingNode('2001:db8::1:443').valid, false);
 
 console.log('agent config tests passed');

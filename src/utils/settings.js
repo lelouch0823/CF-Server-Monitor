@@ -49,6 +49,55 @@ const LEGACY_DEFAULT_NOTIFICATION_WEBHOOK_BODIES = [
 ];
 export const NOTIFICATION_WEBHOOK_METHODS = ['GET', 'POST'];
 export const NOTIFICATION_WEBHOOK_FORMATS = ['json', 'form', 'text'];
+
+export const TEXT_SETTING_MAX_LENGTHS = Object.freeze({
+  username: 128,
+  tg_bot_token: 2048,
+  tg_chat_id: 256,
+  notification_webhook_url: 2048,
+  turnstile_site_key: 256,
+  turnstile_secret_key: 256,
+  cloudflare_account_id: 256,
+  cloudflare_token: 256,
+  custom_ct_name: 64,
+  custom_cu_name: 64,
+  custom_cm_name: 64,
+  custom_bd_name: 64,
+  node_1_name: 64,
+  node_2_name: 64,
+  node_3_name: 64,
+  node_4_name: 64,
+  site_title: 128,
+  custom_bg: 2048,
+  custom_bg_mobile: 2048,
+  favicon: 2048,
+  custom_head: 32768,
+  custom_script: 32768
+});
+
+export function validateTextSetting(field, value) {
+  const maxLen = TEXT_SETTING_MAX_LENGTHS[field];
+  if (!maxLen) return { valid: true, value: value == null ? '' : String(value) };
+  if (value === undefined || value === null) return { valid: true, value: '' };
+  if (typeof value === 'object' || typeof value === 'boolean' || typeof value === 'function' || typeof value === 'symbol') {
+    return { valid: false, value: '' };
+  }
+  const str = String(value);
+  if (str.length > maxLen) {
+    return { valid: false, value: str.slice(0, maxLen) };
+  }
+  return { valid: true, value: str };
+}
+
+export function normalizeTextSetting(field, value, fallback = '') {
+  const maxLen = TEXT_SETTING_MAX_LENGTHS[field] || 4096;
+  if (value === undefined || value === null) return fallback;
+  if (typeof value === 'object' || typeof value === 'boolean' || typeof value === 'function' || typeof value === 'symbol') {
+    return fallback;
+  }
+  const str = String(value);
+  return str.length > maxLen ? str.slice(0, maxLen) : str;
+}
 export const RESOURCE_ALERT_METRIC_CPU = 'cpu';
 export const RESOURCE_ALERT_METRIC_RAM = 'ram';
 export const RESOURCE_ALERT_METRIC_DISK = 'disk';
@@ -449,7 +498,7 @@ export function getResourceAlertRuleThresholds(rule) {
 }
 
 export function getResourceAlertConfig(settings = {}) {
-  const rules = normalizeResourceAlertRules(settings.resource_alert_rules, settings);
+  const rules = normalizeResourceAlertRules(settings.resource_alert_rules);
 
   return {
     enabled: rules.length > 0,
@@ -694,12 +743,16 @@ export async function loadSiteSettings(db, options = {}) {
     result.expire_reminder = normalizeExpireReminder(result.expire_reminder);
     result.long_history_points = normalizeLongHistoryPoints(result.long_history_points);
     result.resource_alert_rules = normalizeResourceAlertRules(result.resource_alert_rules);
-    result.auto_discovery = normalizeBooleanSetting(result.auto_discovery);
+    result.auto_discovery = normalizeBooleanSetting(result.auto_discovery, defaults.auto_discovery);
+    result.is_public = normalizeBooleanSetting(result.is_public, defaults.is_public);
+    result.show_price = normalizeBooleanSetting(result.show_price, defaults.show_price);
+    result.show_expire = normalizeBooleanSetting(result.show_expire, defaults.show_expire);
+    result.show_tf = normalizeBooleanSetting(result.show_tf, defaults.show_tf);
     result.show_three_net_details = normalizeBooleanSetting(result.show_three_net_details, defaults.show_three_net_details);
     result.wss_report_enabled = normalizeBooleanSetting(result.wss_report_enabled, defaults.wss_report_enabled);
     result.wss_report_hours = normalizeWssReportHours(result.wss_report_hours);
     result.frontend_ws_timeout_minutes = normalizeFrontendWsTimeoutMinutes(result.frontend_ws_timeout_minutes);
-    result.notification_webhook_enabled = normalizeBooleanSetting(result.notification_webhook_enabled);
+    result.notification_webhook_enabled = normalizeBooleanSetting(result.notification_webhook_enabled, defaults.notification_webhook_enabled);
     result.notification_webhook_method = normalizeNotificationWebhookMethod(result.notification_webhook_method);
     result.notification_webhook_format = normalizeNotificationWebhookFormat(result.notification_webhook_format);
     result.notification_webhook_headers = normalizeNotificationWebhookHeaders(result.notification_webhook_headers);
@@ -708,8 +761,16 @@ export async function loadSiteSettings(db, options = {}) {
     result.notification_timezone = normalizeNotificationTimezone(result.notification_timezone);
     result.notification_language = normalizeNotificationLanguage(result.notification_language);
     result.expire_notification_time = normalizeExpireNotificationTime(result.expire_notification_time);
+    result.turnstile_enabled = normalizeBooleanSetting(result.turnstile_enabled, defaults.turnstile_enabled);
+    result.turnstile_login_enabled = normalizeBooleanSetting(result.turnstile_login_enabled, defaults.turnstile_login_enabled);
+    result.servers_optimized = normalizeBooleanSetting(result.servers_optimized, defaults.servers_optimized);
     result.traffic_alert_threshold = normalizeTrafficAlertThreshold(result.traffic_alert_threshold);
     result.ua = sanitizeUserAgent(result.ua);
+    for (const textField of Object.keys(TEXT_SETTING_MAX_LENGTHS)) {
+      if (textField in result && SITE_FIELDS.includes(textField)) {
+        result[textField] = normalizeTextSetting(textField, result[textField], defaults[textField] ?? '');
+      }
+    }
   } catch (e) {
     console.error('加载站点设置失败:', e);
     if (cachedSiteSettings) {
@@ -718,6 +779,14 @@ export async function loadSiteSettings(db, options = {}) {
       siteSettingsCacheExpiry = now + SITE_SETTINGS_CACHE_TTL_MS;
       return cachedSiteSettings;
     }
+    // 冷 isolate 首次加载失败时不缓存残缺的默认值：默认值里 jwt_secret 为空，
+    // 挂载非枚举标记供 auth.js 识别并拒绝回退密钥，同时保持可枚举属性完全不变。
+    Object.defineProperty(result, '_degradedColdFailure', {
+      value: true,
+      enumerable: false,
+      configurable: true
+    });
+    return result;
   }
 
   cachedSiteSettings = result;
@@ -762,6 +831,11 @@ export async function loadAppearanceOptions(db) {
     result.display_mode = normalizeDisplayMode(result.display_mode, defaults.display_mode);
     result.preferred_theme = normalizePreferredTheme(result.preferred_theme);
     result.default_language = normalizeDefaultLanguage(result.default_language);
+    for (const textField of Object.keys(TEXT_SETTING_MAX_LENGTHS)) {
+      if (APPEARANCE_FIELDS.includes(textField) && textField in result) {
+        result[textField] = normalizeTextSetting(textField, result[textField], defaults[textField] ?? '');
+      }
+    }
   } catch (e) {
     console.error('加载外观设置失败:', e);
   }
@@ -807,7 +881,15 @@ export async function loadSettings(db) {
     loadSiteSettings(db),
     loadAppearanceOptions(db)
   ]);
-  return { ...defaults, ...siteSettings, ...appearanceOptions };
+  const merged = { ...defaults, ...siteSettings, ...appearanceOptions };
+  if (siteSettings?._degradedColdFailure === true) {
+    Object.defineProperty(merged, '_degradedColdFailure', {
+      value: true,
+      enumerable: false,
+      configurable: true
+    });
+  }
+  return merged;
 }
 
 export async function saveSiteOptions(db, updates) {
@@ -831,12 +913,16 @@ export async function saveSiteOptions(db, updates) {
   siteOptions.expire_reminder = normalizeExpireReminder(siteOptions.expire_reminder);
   siteOptions.long_history_points = normalizeLongHistoryPoints(siteOptions.long_history_points);
   siteOptions.resource_alert_rules = normalizeResourceAlertRules(siteOptions.resource_alert_rules);
-  siteOptions.auto_discovery = normalizeBooleanSetting(siteOptions.auto_discovery);
+  siteOptions.auto_discovery = normalizeBooleanSetting(siteOptions.auto_discovery, defaults.auto_discovery);
+  siteOptions.is_public = normalizeBooleanSetting(siteOptions.is_public, defaults.is_public);
+  siteOptions.show_price = normalizeBooleanSetting(siteOptions.show_price, defaults.show_price);
+  siteOptions.show_expire = normalizeBooleanSetting(siteOptions.show_expire, defaults.show_expire);
+  siteOptions.show_tf = normalizeBooleanSetting(siteOptions.show_tf, defaults.show_tf);
   siteOptions.show_three_net_details = normalizeBooleanSetting(siteOptions.show_three_net_details, defaults.show_three_net_details);
   siteOptions.wss_report_enabled = normalizeBooleanSetting(siteOptions.wss_report_enabled, defaults.wss_report_enabled);
   siteOptions.wss_report_hours = normalizeWssReportHours(siteOptions.wss_report_hours);
   siteOptions.frontend_ws_timeout_minutes = normalizeFrontendWsTimeoutMinutes(siteOptions.frontend_ws_timeout_minutes);
-  siteOptions.notification_webhook_enabled = normalizeBooleanSetting(siteOptions.notification_webhook_enabled);
+  siteOptions.notification_webhook_enabled = normalizeBooleanSetting(siteOptions.notification_webhook_enabled, defaults.notification_webhook_enabled);
   siteOptions.notification_webhook_method = normalizeNotificationWebhookMethod(siteOptions.notification_webhook_method);
   siteOptions.notification_webhook_format = normalizeNotificationWebhookFormat(siteOptions.notification_webhook_format);
   siteOptions.notification_webhook_headers = normalizeNotificationWebhookHeaders(siteOptions.notification_webhook_headers);
@@ -845,8 +931,16 @@ export async function saveSiteOptions(db, updates) {
   siteOptions.notification_timezone = normalizeNotificationTimezone(siteOptions.notification_timezone);
   siteOptions.notification_language = normalizeNotificationLanguage(siteOptions.notification_language);
   siteOptions.expire_notification_time = normalizeExpireNotificationTime(siteOptions.expire_notification_time);
+  siteOptions.turnstile_enabled = normalizeBooleanSetting(siteOptions.turnstile_enabled, defaults.turnstile_enabled);
+  siteOptions.turnstile_login_enabled = normalizeBooleanSetting(siteOptions.turnstile_login_enabled, defaults.turnstile_login_enabled);
+  siteOptions.servers_optimized = normalizeBooleanSetting(siteOptions.servers_optimized, defaults.servers_optimized);
   siteOptions.traffic_alert_threshold = normalizeTrafficAlertThreshold(siteOptions.traffic_alert_threshold);
   siteOptions.ua = sanitizeUserAgent(siteOptions.ua);
+  for (const textField of Object.keys(TEXT_SETTING_MAX_LENGTHS)) {
+    if (SITE_FIELDS.includes(textField) && textField in siteOptions) {
+      siteOptions[textField] = normalizeTextSetting(textField, siteOptions[textField], defaults[textField] ?? '');
+    }
+  }
   
   await db.prepare(
     'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'

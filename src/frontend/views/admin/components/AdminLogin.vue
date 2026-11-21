@@ -36,7 +36,7 @@
           <div id="admin-turnstile-container"></div>
         </div>
         <div v-if="loginError" id="login-error" class="login-error">{{ loginError }}</div>
-        <button type="submit" class="login-btn">{{ loginLoading ? '⏳' : trans.login }}</button>
+        <button type="submit" class="login-btn" :disabled="loginLoading">{{ loginLoading ? '⏳' : trans.login }}</button>
       </form>
     </div>
     <Footer />

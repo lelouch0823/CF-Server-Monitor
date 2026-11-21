@@ -1,7 +1,7 @@
 import { checkAuth, simpleAuthResponse } from '../middleware/auth.js';
 import { getDashboardLatencyHistory, getLatestMetrics, getLatestMetricsForAllServers } from '../database/schema.js';
 import { getAllServers, getServerDetail } from '../utils/cache.js';
-import { mergeMetricsIntoServer, coerceNumericMetricFields } from '../utils/metrics.js';
+import { mergeMetricsIntoServer, coerceNumericMetricFields, toSafeMetricFloat } from '../utils/metrics.js';
 import { normalizeLongHistoryPoints } from '../utils/settings.js';
 import { createSuccessResponse, createBadRequestResponse, createNotFoundResponse } from '../utils/errors.js';
 import {
@@ -55,11 +55,30 @@ function normalizePublicIpFields(item, ensureFields = true) {
   return item;
 }
 
-function withoutPrivateServerFields(server) {
+function withoutPrivateServerFields(server, { isLoggedIn = false, sys = null } = {}) {
   const item = { ...server };
   delete item.bandwidth;
   delete item.note;
   delete item.auto_update;
+  if (!isLoggedIn) {
+    // 仅运维/管理使用的内部字段不下发给访客
+    delete item.traffic_alert_state;
+    delete item.rx_correction;
+    delete item.tx_correction;
+    delete item.history_partition_id;
+    delete item.offline_notify_disabled;
+  }
+  if (sys) {
+    // 显示开关关闭时在服务端剔除对应账单字段，避免仅靠前端隐藏造成的可读取数据
+    if (sys.show_price !== 'true') {
+      delete item.price;
+      delete item.currency;
+      delete item.billing_cycle;
+    }
+    if (sys.show_expire !== 'true') {
+      delete item.expire_date;
+    }
+  }
   return normalizePublicIpFields(item);
 }
 
@@ -204,7 +223,7 @@ export async function handleServerAPI(request, env, sys) {
     long_history_points: Number(normalizeLongHistoryPoints(sys.long_history_points))
   };
   
-  return createSuccessResponse(omitNullLossProbeFields(withoutPrivateServerFields(server)));
+  return createSuccessResponse(omitNullLossProbeFields(withoutPrivateServerFields(server, { isLoggedIn, sys })));
 }
 
 export async function handleServersAPI(request, env, sys) {
@@ -215,7 +234,8 @@ export async function handleServersAPI(request, env, sys) {
   }
   markFrontendRealtimeActive();
   
-  const results = (await getAllServers(env.DB, isLoggedIn)).map(withoutPrivateServerFields);
+  const results = (await getAllServers(env.DB, isLoggedIn))
+    .map(server => withoutPrivateServerFields(server, { isLoggedIn, sys }));
   const shouldIncludeLatencyHistory = sys.show_three_net_details === 'true';
   
   const serverIds = results.map(server => server.id).filter(Boolean);
@@ -246,12 +266,12 @@ export async function handleServersAPI(request, env, sys) {
     
     if (isOnline) {
       globalOnline++;
-      globalSpeedIn += parseFloat(server.net_in_speed) || 0;
-      globalSpeedOut += parseFloat(server.net_out_speed) || 0;
+      globalSpeedIn += toSafeMetricFloat(server.net_in_speed);
+      globalSpeedOut += toSafeMetricFloat(server.net_out_speed);
     }
     
-    globalNetRx += parseFloat(server.net_rx || 0);
-    globalNetTx += parseFloat(server.net_tx || 0);
+    globalNetRx += toSafeMetricFloat(server.net_rx);
+    globalNetTx += toSafeMetricFloat(server.net_tx);
     
     let cCode = (server.region || '').toUpperCase();
     if (cCode !== '') {

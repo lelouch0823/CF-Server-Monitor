@@ -39,6 +39,229 @@ const RESOURCE_ALERT_STATE_ACTIVE = 'active';
 const RESOURCE_ALERT_STATE_RECOVERED = 'recovered';
 const RESOURCE_ALERT_STATE_KEY = 'resource_alert_state';
 const DAY_MS = 24 * 60 * 60 * 1000;
+const NOTIFICATION_CHUNK_MAX_CHARS = 1800;
+const NOTIFICATION_FETCH_TIMEOUT_MS = 8000;
+const SMTP_SEND_TIMEOUT_MS = 10000;
+
+function isPrivateOrReservedIpv4Octets(a, b) {
+  if (a === 0 || a === 10 || a === 127) return true;
+  if (a === 169 && b === 254) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 100 && b >= 64 && b <= 127) return true;
+  if (a >= 224) return true;
+  return false;
+}
+
+function parseIpv6Hextets(ipv6Host) {
+  const zoneStripped = String(ipv6Host || '').split('%')[0].toLowerCase();
+  if (!zoneStripped || !zoneStripped.includes(':')) return null;
+
+  let working = zoneStripped;
+  // Support embedded dotted-quad IPv4 suffix if present before URL normalization
+  const lastColon = working.lastIndexOf(':');
+  const tailSegment = working.slice(lastColon + 1);
+  if (tailSegment.includes('.')) {
+    const v4Match = tailSegment.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (!v4Match) return null;
+    const octets = v4Match.slice(1).map(Number);
+    if (octets.some(n => !Number.isInteger(n) || n < 0 || n > 255)) return null;
+    const hiHex = ((octets[0] << 8) | octets[1]).toString(16);
+    const loHex = ((octets[2] << 8) | octets[3]).toString(16);
+    working = `${working.slice(0, lastColon + 1)}${hiHex}:${loHex}`;
+  }
+
+  const doubleColonParts = working.split('::');
+  if (doubleColonParts.length > 2) return null;
+
+  const parsePart = part => {
+    if (!part) return [];
+    const tokens = part.split(':');
+    const nums = [];
+    for (const token of tokens) {
+      if (!/^[0-9a-f]{1,4}$/i.test(token)) return null;
+      nums.push(parseInt(token, 16));
+    }
+    return nums;
+  };
+
+  if (doubleColonParts.length === 2) {
+    const left = parsePart(doubleColonParts[0]);
+    const right = parsePart(doubleColonParts[1]);
+    if (!left || !right || left.length + right.length >= 8) return null;
+    const zeros = new Array(8 - left.length - right.length).fill(0);
+    return [...left, ...zeros, ...right];
+  }
+
+  const full = parsePart(working);
+  return full && full.length === 8 ? full : null;
+}
+
+function isBlockedIpv6Hextets(h) {
+  const [h0, h1, h2, h3, h4, h5, h6, h7] = h;
+  const tailA = (h6 >> 8) & 0xff;
+  const tailB = h6 & 0xff;
+
+  // Unspecified (::/128) & Loopback (::1/128)
+  if (h0 === 0 && h1 === 0 && h2 === 0 && h3 === 0 && h4 === 0 && h5 === 0 && h6 === 0 && (h7 === 0 || h7 === 1)) {
+    return true;
+  }
+
+  // IPv4-compatible IPv6 (::w.x.y.z, ::/96)
+  if (h0 === 0 && h1 === 0 && h2 === 0 && h3 === 0 && h4 === 0 && h5 === 0) {
+    return isPrivateOrReservedIpv4Octets(tailA, tailB);
+  }
+
+  // IPv4-mapped IPv6 (::ffff:w.x.y.z)
+  if (h0 === 0 && h1 === 0 && h2 === 0 && h3 === 0 && h4 === 0 && h5 === 0xffff) {
+    return isPrivateOrReservedIpv4Octets(tailA, tailB);
+  }
+
+  // SIIT IPv4-translated IPv6 (::ffff:0:w.x.y.z)
+  if (h0 === 0 && h1 === 0 && h2 === 0 && h3 === 0 && h4 === 0xffff && h5 === 0) {
+    return isPrivateOrReservedIpv4Octets(tailA, tailB);
+  }
+
+  // NAT64 Well-Known Prefix (64:ff9b::/96 and local-use 64:ff9b:1::/48)
+  if (h0 === 0x0064 && h1 === 0xff9b && ((h2 === 0 && h3 === 0 && h4 === 0 && h5 === 0) || h2 === 1)) {
+    return isPrivateOrReservedIpv4Octets(tailA, tailB);
+  }
+
+  // 6to4 (2002::/16) embeds IPv4 in h1:h2
+  if (h0 === 0x2002) {
+    const v4a = (h1 >> 8) & 0xff;
+    const v4b = h1 & 0xff;
+    return isPrivateOrReservedIpv4Octets(v4a, v4b);
+  }
+
+  // Multicast (ff00::/8)
+  if ((h0 & 0xff00) === 0xff00) {
+    return true;
+  }
+
+  // Link-local (fe80::/10)
+  if ((h0 & 0xffc0) === 0xfe80) {
+    return true;
+  }
+
+  // Unique Local Address (fc00::/7)
+  if ((h0 & 0xfe00) === 0xfc00) {
+    return true;
+  }
+
+  return false;
+}
+
+export function isBlockedNotificationHost(rawHost) {
+  const rawTrimmed = String(rawHost || '').trim();
+  if (!rawTrimmed) return true;
+
+  let candidate = rawTrimmed.replace(/^\[|\]$/g, '').replace(/\.+$/, '').toLowerCase();
+  if (!candidate) return true;
+
+  // 先用标准 WHATWG URL 解析器规范化主机名（将八进制 0177.0.0.1、十进制 2130706433、缩写 127.1、十六进制 0x7f.1 等统一转为标准点分 IPv4）
+  let host = candidate;
+  try {
+    const authorityHost = candidate.includes(':') ? `[${candidate}]` : candidate;
+    const normalizedUrl = new URL(`http://${authorityHost}`);
+    host = normalizedUrl.hostname.replace(/^\[|\]$/g, '').replace(/\.+$/, '').toLowerCase();
+  } catch (_) {
+    return true;
+  }
+  if (!host) return true;
+
+  if (
+    host === 'localhost' ||
+    host.endsWith('.localhost') ||
+    host.endsWith('.local') ||
+    host.endsWith('.internal') ||
+    host === 'metadata' ||
+    host === 'instance-data' ||
+    host === '0' ||
+    host === '0.0.0.0'
+  ) {
+    return true;
+  }
+
+  const ipv4Match = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (ipv4Match) {
+    const octets = ipv4Match.slice(1).map(Number);
+    if (octets.some(n => !Number.isInteger(n) || n < 0 || n > 255)) return true;
+    return isPrivateOrReservedIpv4Octets(octets[0], octets[1]);
+  }
+
+  if (host.includes(':')) {
+    const hextets = parseIpv6Hextets(host);
+    if (!hextets) return true;
+    return isBlockedIpv6Hextets(hextets);
+  }
+
+  return false;
+}
+
+export function validateSafeNotificationUrl(rawUrl) {
+  let parsed;
+  try {
+    parsed = rawUrl instanceof URL ? rawUrl : new URL(String(rawUrl || '').trim());
+  } catch (_) {
+    throw new Error('通知目标 URL 格式无效');
+  }
+
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    throw new Error('通知目标 URL 仅支持 http/https 协议');
+  }
+
+  if (isBlockedNotificationHost(parsed.hostname)) {
+    throw new Error('通知目标地址不允许指向本地回环、内网或云元数据地址');
+  }
+
+  return parsed;
+}
+
+export function splitNotificationEntries(entries, maxChars = NOTIFICATION_CHUNK_MAX_CHARS) {
+  if (!Array.isArray(entries) || entries.length === 0) return [];
+  const limit = Math.max(64, Number(maxChars) || NOTIFICATION_CHUNK_MAX_CHARS);
+  const chunks = [];
+  let currentLines = [];
+  let currentClients = [];
+  let currentItems = [];
+  let currentLen = 0;
+
+  const flush = () => {
+    if (currentLines.length === 0) return;
+    const text = currentLines.join('\n');
+    chunks.push({
+      text,
+      clients: currentClients,
+      count: currentItems.length,
+      items: currentItems
+    });
+    currentLines = [];
+    currentClients = [];
+    currentItems = [];
+    currentLen = 0;
+  };
+
+  for (const entry of entries) {
+    if (!entry) continue;
+    const rawLine = String(entry.text || '').trim();
+    if (!rawLine) continue;
+    const safeLine = rawLine.length > limit ? `${rawLine.slice(0, limit - 3)}...` : rawLine;
+    const addedLen = currentLines.length === 0 ? safeLine.length : currentLen + 1 + safeLine.length;
+
+    if (currentLines.length > 0 && addedLen > limit) {
+      flush();
+    }
+
+    currentLines.push(safeLine);
+    if (entry.client) currentClients.push(String(entry.client));
+    currentItems.push(entry.item);
+    currentLen = currentLines.length === 1 ? safeLine.length : currentLen + 1 + safeLine.length;
+  }
+
+  flush();
+  return chunks;
+}
 
 // 记录本 isolate 是否已确认资源告警状态为空，避免每分钟重复执行一次 DELETE
 let resourceAlertStateKnownEmpty = false;
@@ -295,8 +518,12 @@ function buildGroupedResourceAlertEntries(nodes, valueKey, messages) {
 
     let group = groups.get(serverName);
     if (!group) {
-      group = { serverName, metrics: [], seen: new Set() };
+      group = { serverName, metrics: [], seen: new Set(), stateKeys: [] };
       groups.set(serverName, group);
+    }
+
+    if (item.key && !group.stateKeys.includes(item.key)) {
+      group.stateKeys.push(item.key);
     }
 
     for (const metric of sourceMetrics) {
@@ -311,31 +538,37 @@ function buildGroupedResourceAlertEntries(nodes, valueKey, messages) {
     .filter(group => group.metrics.length > 0)
     .map(group => ({
       serverName: group.serverName,
+      stateKeys: group.stateKeys,
       text: `${group.serverName}  ${group.metrics.join('  ')}`
     }));
 }
 
-function appendResourceAlertNotificationChunks(payloads, entries, options) {
+function appendResourceAlertNotificationChunks(planItems, entries, options) {
   if (!Array.isArray(entries) || entries.length === 0) return;
 
   let chunkEntries = [];
   let chunkClients = [];
+  let chunkStateKeys = [];
   const flush = () => {
     if (chunkEntries.length === 0) return;
 
     const nodeList = chunkEntries.map(entry => entry.text).join('\n');
-    payloads.push({
-      msg: nodeList,
-      context: {
-        event: options.event,
-        emoji: options.emoji,
-        clients: chunkClients,
-        count: new Set(chunkClients).size || chunkEntries.length,
-        message: nodeList
-      }
+    planItems.push({
+      payload: {
+        msg: nodeList,
+        context: {
+          event: options.event,
+          emoji: options.emoji,
+          clients: chunkClients,
+          count: new Set(chunkClients).size || chunkEntries.length,
+          message: nodeList
+        }
+      },
+      stateKeys: Array.from(new Set(chunkStateKeys))
     });
     chunkEntries = [];
     chunkClients = [];
+    chunkStateKeys = [];
   };
 
   for (const entry of entries) {
@@ -347,16 +580,17 @@ function appendResourceAlertNotificationChunks(payloads, entries, options) {
     }
     chunkEntries.push(entry);
     if (entry.serverName) chunkClients.push(entry.serverName);
+    if (Array.isArray(entry.stateKeys)) chunkStateKeys.push(...entry.stateKeys);
   }
 
   flush();
 }
 
-export function buildResourceAlertNotificationPayloads(alertNodes, recoveredNodes, settings = {}) {
+function buildResourceAlertDeliveryPlan(alertNodes, recoveredNodes, settings = {}) {
   const messages = getNotificationMessages(settings);
-  const payloads = [];
+  const planItems = [];
   appendResourceAlertNotificationChunks(
-    payloads,
+    planItems,
     buildGroupedResourceAlertEntries(alertNodes, 'triggerValue', messages),
     {
       event: messages.events.resourceAlert,
@@ -364,14 +598,18 @@ export function buildResourceAlertNotificationPayloads(alertNodes, recoveredNode
     }
   );
   appendResourceAlertNotificationChunks(
-    payloads,
+    planItems,
     buildGroupedResourceAlertEntries(recoveredNodes, 'current', messages),
     {
       event: messages.events.resourceRecovered,
       emoji: '✅'
     }
   );
-  return payloads;
+  return planItems;
+}
+
+export function buildResourceAlertNotificationPayloads(alertNodes, recoveredNodes, settings = {}) {
+  return buildResourceAlertDeliveryPlan(alertNodes, recoveredNodes, settings).map(item => item.payload);
 }
 
 async function evaluateResourceAlertRules(stub, ruleRequests) {
@@ -453,16 +691,32 @@ async function evaluateResourceAlertRules(stub, ruleRequests) {
   return resultMap;
 }
 
-async function fetchWithRetry(url, options, retries = NOTIFICATION_MAX_RETRIES) {
+async function fetchWithRetry(url, options = {}, retries = NOTIFICATION_MAX_RETRIES) {
+  const safeUrl = validateSafeNotificationUrl(url);
   for (let i = 0; i < retries; i++) {
     try {
-      const response = await fetch(url, options);
+      const requestOptions = {
+        ...options,
+        redirect: 'error',
+        signal: options?.signal || AbortSignal.timeout(NOTIFICATION_FETCH_TIMEOUT_MS)
+      };
+      const response = await fetch(safeUrl.toString(), requestOptions);
       if (response.ok) return response;
-      
+
+      const status = Number(response.status) || 0;
+      if (status >= 400 && status < 500 && status !== 408 && status !== 429) {
+        throw new Error(`HTTP ${status}`);
+      }
+
       if (i < retries - 1) {
         await new Promise(resolve => setTimeout(resolve, NOTIFICATION_RETRY_DELAY_MS));
+      } else {
+        throw new Error(`HTTP ${status || 'error'}`);
       }
     } catch (e) {
+      if (e?.message && /^HTTP 4\d\d$/.test(e.message) && e.message !== 'HTTP 408' && e.message !== 'HTTP 429') {
+        throw e;
+      }
       if (i < retries - 1) {
         await new Promise(resolve => setTimeout(resolve, NOTIFICATION_RETRY_DELAY_MS));
       } else {
@@ -582,12 +836,32 @@ function buildWebhookQueryParams(settings, context) {
   return Array.from(params.entries());
 }
 
-function buildWebhookUrl(settings, context, method) {
-  const rawUrl = settings.notification_webhook_url;
-  const renderedUrl = renderTemplate(String(rawUrl || '').trim(), context);
-  if (!renderedUrl) throw new Error('missing webhook url');
+function renderUrlTemplate(template, data) {
+  const source = String(template || '');
+  return source.replace(/\{\{\s*([A-Za-z0-9_]+)\s*\}\}/g, (_, key) => {
+    const value = data[key] ?? '';
+    return encodeURIComponent(String(value));
+  });
+}
 
-  const url = new URL(renderedUrl);
+function buildWebhookUrl(settings, context, method) {
+  const trimmedRawUrl = String(settings.notification_webhook_url || '').trim();
+  if (!trimmedRawUrl) throw new Error('missing webhook url');
+
+  // 禁止通过模板变量动态篡改协议/主机名导致 SSRF
+  const staticProbe = trimmedRawUrl.replace(/\{\{\s*[A-Za-z0-9_]+\s*\}\}/g, 'tpl');
+  const baseParsed = validateSafeNotificationUrl(staticProbe);
+  const schemeAndAuthority = trimmedRawUrl.match(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/([^/?#]+)/);
+  if (!schemeAndAuthority || /\{\{/.test(schemeAndAuthority[0])) {
+    throw new Error('webhook url authority cannot contain template variables');
+  }
+
+  const renderedUrl = renderUrlTemplate(trimmedRawUrl, context);
+  const url = validateSafeNotificationUrl(renderedUrl);
+  if (url.hostname.toLowerCase() !== baseParsed.hostname.toLowerCase()) {
+    throw new Error('webhook url host mismatch');
+  }
+
   if (method === 'GET') {
     for (const [key, value] of buildWebhookQueryParams(settings, context)) {
       if (!key) continue;
@@ -702,7 +976,11 @@ export async function evaluateTrafficAlert(env, server, metrics, hooks = {}) {
         const { meta } = await env.DB.prepare(
           `UPDATE servers SET traffic_alert_state = NULL WHERE id = ? AND COALESCE(traffic_alert_state,'') = ?`
         ).bind(server.id, oldStr).run();
-        if (meta && meta.changes > 0) hooks.patchCache?.(server.id, null);
+        if (meta && meta.changes > 0) {
+          hooks.patchCache?.(server.id, null);
+        } else {
+          hooks.invalidateCache?.(server.id);
+        }
         return;
       }
       // ② 规则签名一致且未回落 → 同账期已发，抑制
@@ -735,7 +1013,11 @@ export async function evaluateTrafficAlert(env, server, metrics, hooks = {}) {
     const { meta } = await env.DB.prepare(
       `UPDATE servers SET traffic_alert_state = ? WHERE id = ? AND COALESCE(traffic_alert_state,'') = ?`
     ).bind(newStr, server.id, oldStr).run();
-    if (meta && meta.changes > 0) hooks.patchCache?.(server.id, newStr);
+    if (meta && meta.changes > 0) {
+      hooks.patchCache?.(server.id, newStr);
+    } else {
+      hooks.invalidateCache?.(server.id);
+    }
   } catch (e) {
     console.error('[traffic-alert] evaluate failed:', e);
   }
@@ -751,6 +1033,9 @@ function parseSmtpNotificationConfig(rawToken) {
   const url = new URL(String(rawToken).trim());
   const host = url.hostname;
   if (!host) throw new Error('缺少 SMTP 主机');
+  if (isBlockedNotificationHost(host)) {
+    throw new Error('SMTP 主机不允许指向本地回环、内网或云元数据地址');
+  }
 
   const secureParam = (url.searchParams.get('secure') || 'auto').toLowerCase();
   // 不提供 'off'（明文传输），避免凭据被静默降级为明文发送
@@ -822,6 +1107,16 @@ async function withSmtpRetry(task, retries = NOTIFICATION_MAX_RETRIES) {
   throw lastError || new Error('Max retries exceeded');
 }
 
+function withPromiseTimeout(promise, timeoutMs, timeoutMessage) {
+  let timer = null;
+  const timeoutPromise = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
 async function sendSmtpNotification(settings, context, formattedMsg) {
   let config;
   try {
@@ -832,24 +1127,33 @@ async function sendSmtpNotification(settings, context, formattedMsg) {
   try {
     // 动态导入：cloudflare-smtp 依赖 cloudflare:sockets，仅在运行时（Workers）加载
     const { sendMail } = await import('cloudflare-smtp');
-    const subject = `${context.emoji || ''} ${context.event || getNotificationMessages(settings).events.notification}`.trim();
+    const rawSubject = `${context.emoji || ''} ${context.event || getNotificationMessages(settings).events.notification}`;
+    const subject = rawSubject.replace(/[\r\n\u0000]+/g, ' ').trim().slice(0, 256);
     const text = String(formattedMsg || '').replace(/\*/g, '');
-    await withSmtpRetry(() => sendMail(
-      {
-        host: config.host,
-        port: config.port,
-        username: config.username,
-        password: config.password,
-        from: config.from,
-        to: config.to,
-        secureTransport: config.secureTransport
-      },
-      { subject, text }
+    await withSmtpRetry(() => withPromiseTimeout(
+      sendMail(
+        {
+          host: config.host,
+          port: config.port,
+          username: config.username,
+          password: config.password,
+          from: config.from,
+          to: config.to,
+          secureTransport: config.secureTransport
+        },
+        { subject, text }
+      ),
+      SMTP_SEND_TIMEOUT_MS,
+      'SMTP 发送超时'
     ));
     return;
   } catch (e) {
     return `SMTP 邮件通知发送失败: ${e.message}`;
   }
+}
+
+function matchesExactOrSubdomain(hostname, domain) {
+  return hostname === domain || hostname.endsWith(`.${domain}`);
 }
 
 export async function sendNotification(settings, msg, notificationContext = {}) {
@@ -868,22 +1172,21 @@ export async function sendNotification(settings, msg, notificationContext = {}) 
     }
   }
 
-  if(!settings.tg_bot_token) return;
-  if (isSmtpNotificationTarget(settings.tg_bot_token)) {
+  const rawToken = String(settings?.tg_bot_token || '').trim();
+  if (!rawToken) return;
+  if (isSmtpNotificationTarget(rawToken)) {
     // SMTP 邮件通知（前缀协议: smtp://...），置于内置渠道分发链最前
     return await sendSmtpNotification(settings, context, formattedMsg);
   }
-  if(settings.tg_bot_token.indexOf("onebot:") == 0) {
-    // OneBot 协议 (QQ 等)，私聊格式: onebot:http://127.0.0.1:3000/send_private_msg?access_token=xxx
-    // 群聊格式: onebot:http://127.0.0.1:3000/send_group_msg?access_token=xxx
-    let onebotUrl = settings.tg_bot_token.replace("onebot:", "");
+  if (rawToken.toLowerCase().startsWith('onebot:')) {
+    const onebotUrl = rawToken.slice('onebot:'.length).trim();
     const targetId = settings.tg_chat_id || '';
-    const isGroup = onebotUrl.indexOf("send_group_msg") != -1;
     if (!targetId) {
       return "OneBot 通知失败: 缺少 tg_chat_id（私人: QQ号，群: group:群号）";
     }
     try {
-      const endpoint = onebotUrl.trim();
+      const parsedUrl = validateSafeNotificationUrl(onebotUrl);
+      const isGroup = parsedUrl.pathname.includes('send_group_msg');
       const body = {
         [isGroup ? 'group_id' : 'user_id']: targetId,
         message: [
@@ -895,53 +1198,21 @@ export async function sendNotification(settings, msg, notificationContext = {}) 
           }
         ]
       };
-      await fetchWithRetry(endpoint, {
+      await fetchWithRetry(parsedUrl.toString(), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body)
       });
+      return;
     } catch (e) {
       return "OneBot 通知发送失败: " + e.message;
     }
-  }else if(settings.tg_bot_token.includes("open.feishu.cn")) {
-    // 飞书机器人 Webhook
+  }
+  if (rawToken.toLowerCase().startsWith('bark:')) {
+    const barkUrl = rawToken.slice('bark:'.length).trim();
     try {
-      await fetchWithRetry(settings.tg_bot_token, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json; charset=utf-8' },
-        body: JSON.stringify({
-          msg_type: "interactive",
-          card: {
-            schema: "2.0",
-            header: { template: "blue", title: { content: title, tag: "plain_text" } },
-            body: { elements: [{ tag: "markdown", content: formattedMsg }] }
-          }
-        })
-      });
-    } catch (e) {
-      return "飞书通知发送失败: " + e.message;
-    }
-  }else if(settings.tg_bot_token.includes("oapi.dingtalk.com") || settings.tg_bot_token.includes("api.dingtalk.com")) {
-    // 钉钉机器人 Webhook
-    try {
-      await fetchWithRetry(settings.tg_bot_token, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          msgtype: "markdown",
-          markdown: { title: title, text: formattedMsg }
-        })
-      });
-    } catch (e) {
-      return "钉钉通知发送失败: " + e.message;
-    }
-  }else if(settings.tg_bot_token.includes("https://api.day.app/") || settings.tg_bot_token.indexOf("bark:") == 0) {
-    let barkUrl = settings.tg_bot_token;
-    if(barkUrl.indexOf("bark:") == 0) {
-      barkUrl = barkUrl.replace("bark:", "");
-    }
-    try {
-      await fetchWithRetry(barkUrl, {
+      const parsedUrl = validateSafeNotificationUrl(barkUrl);
+      await fetchWithRetry(parsedUrl.toString(), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -950,32 +1221,16 @@ export async function sendNotification(settings, msg, notificationContext = {}) 
           group: "Cloudflare Server Monitor"
         })
       });
+      return;
     } catch (e) {
       return "Bark通知发送失败: " + e.message;
     }
-  }else if(settings.tg_bot_token.includes("https://qyapi.weixin.qq.com")){
+  }
+  if (rawToken.toLowerCase().startsWith('server:')) {
+    const serverUrl = rawToken.slice('server:'.length).trim();
     try {
-      await fetchWithRetry(settings.tg_bot_token, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          msgtype: "text",
-          text: {
-            content: formattedMsg.replace(/\*/g, '')
-          }
-        })
-      });
-    } catch (e) {
-      return "企业微信通知发送失败: " + e.message;
-    }
-  // Server 酱（使用 sendkey）
-  }else if(settings.tg_bot_token.includes("https://sctapi.ftqq.com/") || settings.tg_bot_token.indexOf("server:") == 0) {
-    let serverUrl = settings.tg_bot_token;
-    if(serverUrl.indexOf("server:") == 0) {
-      serverUrl = serverUrl.replace("server:", "");
-    }
-    try {
-      await fetchWithRetry(serverUrl, {
+      const parsedUrl = validateSafeNotificationUrl(serverUrl);
+      await fetchWithRetry(parsedUrl.toString(), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -983,48 +1238,158 @@ export async function sendNotification(settings, msg, notificationContext = {}) 
           desp: formattedMsg
         })
       });
+      return;
     } catch (e) {
       return "Server酱通知发送失败: " + e.message;
     }
-  }else if(settings.tg_bot_token.includes("https://wxpusher.zjiecode.com/api/send/message/SPT_")) {
-    const match = settings.tg_bot_token.match(/\/message\/([^/]+)/);
-    const spt = match ? match[1] : null;
-    if (!spt) return "WxPusher 通知失败: 无法提取 SPT";
+  }
+
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(rawToken)) {
+    let parsedUrl;
     try {
-      await fetchWithRetry("https://wxpusher.zjiecode.com/api/send/message/simple-push", {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          "content": formattedMsg,
-          "summary": title,
-          "contentType":3,
-          "spt": spt,
-        })
-      });
+      parsedUrl = validateSafeNotificationUrl(rawToken);
     } catch (e) {
-      return "WxPusher通知发送失败: " + e.message;
+      return "通知地址校验失败: " + e.message;
     }
-  }else if(settings.tg_bot_token.includes("/message?token=")) {
-    try {
-      await fetchWithRetry(settings.tg_bot_token, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          title: title,
-          message: formattedMsg,
-          priority: 5,
-          extras: {
-            "client::display": { "contentType": "text/markdown" }
-          }
-        })
-      });
-    } catch (e) {
-      return "Gotify通知发送失败: " + e.message;
+    const hostname = parsedUrl.hostname.toLowerCase();
+
+    if (matchesExactOrSubdomain(hostname, 'feishu.cn') || matchesExactOrSubdomain(hostname, 'larksuite.com')) {
+      try {
+        await fetchWithRetry(parsedUrl.toString(), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json; charset=utf-8' },
+          body: JSON.stringify({
+            msg_type: "interactive",
+            card: {
+              schema: "2.0",
+              header: { template: "blue", title: { content: title, tag: "plain_text" } },
+              body: { elements: [{ tag: "markdown", content: formattedMsg }] }
+            }
+          })
+        });
+        return;
+      } catch (e) {
+        return "飞书通知发送失败: " + e.message;
+      }
     }
-  }else if(settings.tg_chat_id) {
-    // Telegram Bot (最后 fallback，通过 chat_id 判断)
+
+    if (hostname === 'oapi.dingtalk.com' || hostname === 'api.dingtalk.com') {
+      try {
+        await fetchWithRetry(parsedUrl.toString(), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            msgtype: "markdown",
+            markdown: { title: title, text: formattedMsg }
+          })
+        });
+        return;
+      } catch (e) {
+        return "钉钉通知发送失败: " + e.message;
+      }
+    }
+
+    if (hostname === 'api.day.app') {
+      try {
+        await fetchWithRetry(parsedUrl.toString(), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            title: title,
+            markdown: formattedMsg,
+            group: "Cloudflare Server Monitor"
+          })
+        });
+        return;
+      } catch (e) {
+        return "Bark通知发送失败: " + e.message;
+      }
+    }
+
+    if (hostname === 'qyapi.weixin.qq.com') {
+      try {
+        await fetchWithRetry(parsedUrl.toString(), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            msgtype: "text",
+            text: {
+              content: formattedMsg.replace(/\*/g, '')
+            }
+          })
+        });
+        return;
+      } catch (e) {
+        return "企业微信通知发送失败: " + e.message;
+      }
+    }
+
+    if (hostname === 'sctapi.ftqq.com') {
+      try {
+        await fetchWithRetry(parsedUrl.toString(), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            title: title,
+            desp: formattedMsg
+          })
+        });
+        return;
+      } catch (e) {
+        return "Server酱通知发送失败: " + e.message;
+      }
+    }
+
+    if (hostname === 'wxpusher.zjiecode.com' && parsedUrl.pathname.startsWith('/api/send/message/SPT_')) {
+      const match = parsedUrl.pathname.match(/\/message\/(SPT_[A-Za-z0-9_-]+)/);
+      const spt = match ? match[1] : null;
+      if (!spt) return "WxPusher 通知失败: 无法提取 SPT";
+      try {
+        await fetchWithRetry("https://wxpusher.zjiecode.com/api/send/message/simple-push", {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            content: formattedMsg,
+            summary: title,
+            contentType: 3,
+            spt
+          })
+        });
+        return;
+      } catch (e) {
+        return "WxPusher通知发送失败: " + e.message;
+      }
+    }
+
+    if (parsedUrl.pathname.endsWith('/message') && parsedUrl.searchParams.has('token')) {
+      try {
+        await fetchWithRetry(parsedUrl.toString(), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            title: title,
+            message: formattedMsg,
+            priority: 5,
+            extras: {
+              "client::display": { "contentType": "text/markdown" }
+            }
+          })
+        });
+        return;
+      } catch (e) {
+        return "Gotify通知发送失败: " + e.message;
+      }
+    }
+
+    return "未知的通知方式";
+  }
+
+  if (settings.tg_chat_id) {
+    if (!/^[A-Za-z0-9:_-]+$/.test(rawToken)) {
+      return "Telegram 通知发送失败: Bot Token 格式无效";
+    }
     try {
-      await fetchWithRetry(`https://api.telegram.org/bot${settings.tg_bot_token}/sendMessage`, {
+      await fetchWithRetry(`https://api.telegram.org/bot${rawToken}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1032,12 +1397,13 @@ export async function sendNotification(settings, msg, notificationContext = {}) 
           text: formattedMsg
         })
       });
+      return;
     } catch (e) {
       return "Telegram 通知发送失败: " + e.message;
     }
-  }else {
-    return "未知的通知方式";
   }
+
+  return "未知的通知方式";
 }
 
 export async function checkOfflineNodes(db, options = {}) {
@@ -1047,7 +1413,9 @@ export async function checkOfflineNodes(db, options = {}) {
   if (tgNotifyMinutes === 0 || !hasNotificationTarget(siteSettings)) return;
 
   try {
-    const servers = (await getAllServers(db)).filter(server => server.offline_notify_disabled !== '1');
+    const allServers = await getAllServers(db);
+    const existingServerIds = new Set(allServers.map(server => String(server.id)));
+    const servers = allServers.filter(server => server.offline_notify_disabled !== '1');
     if (servers.length === 0) return;
 
     const latestTimestampsMap = await getLatestTimestampsForAllServers(db, { servers });
@@ -1062,11 +1430,23 @@ export async function checkOfflineNodes(db, options = {}) {
       "SELECT value FROM settings WHERE key = 'alert_state'"
     ).first();
     
-    if (stateRes) {
+    if (stateRes && stateRes.value) {
       try {
-        alertState = JSON.parse(stateRes.value);
+        const parsed = JSON.parse(stateRes.value);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          alertState = Object.assign({}, parsed);
+        }
       } catch (e) {
         alertState = {};
+      }
+    }
+
+    let stateChanged = false;
+    // 清理已从数据库删除的服务器残留 key，保留仍存在于 allServers 的节点状态
+    for (const key of Object.keys(alertState)) {
+      if (!existingServerIds.has(key)) {
+        delete alertState[key];
+        stateChanged = true;
       }
     }
 
@@ -1084,49 +1464,79 @@ export async function checkOfflineNodes(db, options = {}) {
         isOffline = now - lastReportTime > offlineThreshold;
       }
 
-      if (isOffline && !alertState[s.id]) {
+      if (isOffline && !Object.hasOwn(alertState, s.id)) {
         offlineNodes.push({
+          id: s.id,
           name: s.name,
           lastReportTime
         });
-        alertState[s.id] = true;
-      } else if (!isOffline && alertState[s.id]) {
+      } else if (!isOffline && Object.hasOwn(alertState, s.id) && alertState[s.id]) {
         recoveredNodes.push(s);
-        delete alertState[s.id];
       }
     }
 
-    if (offlineNodes.length > 0 || recoveredNodes.length > 0) {
-      await db.prepare(
-        'INSERT INTO settings (key, value) VALUES ("alert_state", ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
-      ).bind(JSON.stringify(alertState)).run();
-    }
-
     const messages = getNotificationMessages(siteSettings);
+
     if (offlineNodes.length > 0) {
-      const nodeList = offlineNodes
-        .map(n => `${n.name}  ${messages.lastReport(formatLastReportTime(n.lastReportTime, siteSettings))}`)
-        .join('\n');
-      const msg = nodeList;
-      await sendNotification(siteSettings, msg, {
-        event: messages.events.offline,
-        emoji: '❌',
-        clients: offlineNodes.map(n => n.name),
-        count: offlineNodes.length,
-        message: nodeList
-      });
+      const offlineChunks = splitNotificationEntries(
+        offlineNodes.map(n => ({
+          text: `${n.name}  ${messages.lastReport(formatLastReportTime(n.lastReportTime, siteSettings))}`,
+          client: n.name,
+          item: n
+        })),
+        NOTIFICATION_CHUNK_MAX_CHARS
+      );
+      for (const chunk of offlineChunks) {
+        const err = await sendNotification(siteSettings, chunk.text, {
+          event: messages.events.offline,
+          emoji: '❌',
+          clients: chunk.clients,
+          count: chunk.count,
+          message: chunk.text
+        });
+        if (err) {
+          console.error('[Cron] 离线告警通知发送失败，下一轮重试:', err);
+        } else {
+          for (const n of chunk.items) {
+            alertState[n.id] = true;
+          }
+          stateChanged = true;
+        }
+      }
     }
 
     if (recoveredNodes.length > 0) {
-      const nodeList = recoveredNodes.map(n => n.name).join('\n');
-      const msg = nodeList;
-      await sendNotification(siteSettings, msg, {
-        event: messages.events.recovered,
-        emoji: '✅',
-        clients: recoveredNodes.map(n => n.name),
-        count: recoveredNodes.length,
-        message: nodeList
-      });
+      const recoveredChunks = splitNotificationEntries(
+        recoveredNodes.map(n => ({
+          text: n.name,
+          client: n.name,
+          item: n
+        })),
+        NOTIFICATION_CHUNK_MAX_CHARS
+      );
+      for (const chunk of recoveredChunks) {
+        const err = await sendNotification(siteSettings, chunk.text, {
+          event: messages.events.recovered,
+          emoji: '✅',
+          clients: chunk.clients,
+          count: chunk.count,
+          message: chunk.text
+        });
+        if (err) {
+          console.error('[Cron] 恢复通知发送失败，下一轮重试:', err);
+        } else {
+          for (const s of chunk.items) {
+            delete alertState[s.id];
+          }
+          stateChanged = true;
+        }
+      }
+    }
+
+    if (stateChanged) {
+      await db.prepare(
+        'INSERT INTO settings (key, value) VALUES ("alert_state", ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
+      ).bind(JSON.stringify(alertState)).run();
     }
   } catch (e) {
     console.error('离线检测失败:', e);
@@ -1224,25 +1634,28 @@ export async function checkResourceAlerts(env, options = {}) {
     ).bind(RESOURCE_ALERT_STATE_KEY).first();
     const hadStoredState = !!stateRow;
     const parsedState = parseResourceAlertState(stateRow);
-    let alertState = parsedState.servers || {};
+    const nextAlertState = parsedState.servers && typeof parsedState.servers === 'object' && !Array.isArray(parsedState.servers)
+      ? { ...parsedState.servers }
+      : {};
 
     const now = Date.now();
     const alertNodes = [];
     const recoveredNodes = [];
+    const pendingStateUpdates = new Map();
     const validStateKeys = new Set(configuredRuleServers.map(item => item.key));
-    let stateChanged = hadStoredState && parsedState.signature !== configSignature;
+    let nonNotifiedStateChanged = hadStoredState && parsedState.signature !== configSignature;
 
-    for (const key of Object.keys(alertState)) {
+    for (const key of Object.keys(nextAlertState)) {
       if (!validStateKeys.has(key)) {
-        delete alertState[key];
-        stateChanged = true;
+        delete nextAlertState[key];
+        nonNotifiedStateChanged = true;
       }
     }
 
     for (const { key, rule, server } of evaluatedRuleServers) {
       const active = activeMap.get(key);
       const alert = active?.alert;
-      const currentState = alertState[key];
+      const currentState = nextAlertState[key];
       const currentStatus = currentState
         ? getResourceAlertStateStatus(currentState)
         : '';
@@ -1258,25 +1671,31 @@ export async function checkResourceAlerts(env, options = {}) {
         }
 
         if (!isActiveAlert) {
-          alertNodes.push({ rule, server, alert });
-          alertState[key] = {
+          const serverName = String(server?.name || '').trim();
+          const newEntry = {
             status: RESOURCE_ALERT_STATE_ACTIVE,
             alertAt: now,
             lastTriggeredAt: now,
             metrics: getStoredResourceAlertMetrics(alert)
           };
-          stateChanged = true;
+          if (serverName) {
+            alertNodes.push({ key, rule, server, alert });
+            pendingStateUpdates.set(key, newEntry);
+          } else {
+            nextAlertState[key] = newEntry;
+            nonNotifiedStateChanged = true;
+          }
         } else {
           const lastTriggeredAt = getResourceAlertStateTimestamp(currentState, 'lastTriggeredAt');
           if (lastTriggeredAt === 0 || now - lastTriggeredAt >= ruleIntervalMs) {
-            alertState[key] = {
+            nextAlertState[key] = {
               ...currentState,
               status: RESOURCE_ALERT_STATE_ACTIVE,
               alertAt: getResourceAlertStateTimestamp(currentState, 'alertAt') || now,
               lastTriggeredAt: now,
               metrics: getStoredResourceAlertMetrics(alert)
             };
-            stateChanged = true;
+            nonNotifiedStateChanged = true;
           }
         }
       } else if (currentState) {
@@ -1286,34 +1705,50 @@ export async function checkResourceAlerts(env, options = {}) {
             continue;
           }
 
-          recoveredNodes.push({ rule, server, metrics: evaluation?.metrics || [] });
-          alertState[key] = {
+          const serverName = String(server?.name || '').trim();
+          const recoveredEntry = {
             ...currentState,
             status: RESOURCE_ALERT_STATE_RECOVERED,
             recoveredAt: now,
             metrics: evaluation?.metrics || currentState.metrics
           };
-          stateChanged = true;
+          if (serverName) {
+            recoveredNodes.push({ key, rule, server, metrics: evaluation?.metrics || [] });
+            pendingStateUpdates.set(key, recoveredEntry);
+          } else {
+            nextAlertState[key] = recoveredEntry;
+            nonNotifiedStateChanged = true;
+          }
         } else {
           const recoveredAt = getResourceAlertStateTimestamp(currentState, 'recoveredAt');
           if (recoveredAt === 0 || now - recoveredAt >= ruleIntervalMs) {
-            delete alertState[key];
-            stateChanged = true;
+            delete nextAlertState[key];
+            nonNotifiedStateChanged = true;
           }
         }
       }
     }
 
-    if (stateChanged) {
-      await saveResourceAlertState(db, configSignature, alertState, hadStoredState);
-    }
-
-    const notificationPayloads = buildResourceAlertNotificationPayloads(alertNodes, recoveredNodes, siteSettings);
-    for (const payload of notificationPayloads) {
-      const notificationError = await sendNotification(siteSettings, payload.msg, payload.context);
+    // 先发送通知分片，仅将发送成功的分片关联的 stateKeys 写入持久化状态；
+    // 发送失败的分片保留原状态，以便下一分钟重试，杜绝“先存库后发通知”漏报。
+    let notifiedStateChanged = false;
+    const deliveryPlan = buildResourceAlertDeliveryPlan(alertNodes, recoveredNodes, siteSettings);
+    for (const item of deliveryPlan) {
+      const notificationError = await sendNotification(siteSettings, item.payload.msg, item.payload.context);
       if (notificationError) {
         console.warn('[ResourceAlert] notification failed:', notificationError);
+        continue;
       }
+      for (const key of item.stateKeys) {
+        if (pendingStateUpdates.has(key)) {
+          nextAlertState[key] = pendingStateUpdates.get(key);
+          notifiedStateChanged = true;
+        }
+      }
+    }
+
+    if (nonNotifiedStateChanged || notifiedStateChanged) {
+      await saveResourceAlertState(db, configSignature, nextAlertState, hadStoredState);
     }
   } catch (e) {
     console.error('资源负载告警检测失败:', e);
@@ -1324,24 +1759,49 @@ export async function checkExpiringServers(db, options = {}) {
   const siteSettings = await loadSiteSettings(db);
   const now = Number(options?.now || Date.now());
 
-  if (options?.scheduled && !isExpireNotificationTimeDue(siteSettings, now)) {
-    return false;
-  }
-
   try {
-    const allServers = await getAllServers(db);
-    const expiringServers = [];
-    const reminderDays = getExpireReminderDays(siteSettings.expire_reminder);
-    const shouldNotify = reminderDays > 0 && hasNotificationTarget(siteSettings);
-    const renewedServers = [];
-    const currentDateSerial = getZonedDateSerial(now, siteSettings.notification_timezone);
+    const zonedParts = getZonedDateParts(now, siteSettings.notification_timezone);
+    const referenceDateStr = zonedParts
+      ? `${String(zonedParts.year).padStart(4, '0')}-${String(zonedParts.month).padStart(2, '0')}-${String(zonedParts.day).padStart(2, '0')}`
+      : undefined;
+    const todaySerial = String(getZonedDateSerial(now, siteSettings.notification_timezone));
 
+    // 当日提醒状态：sent=true 已发送（当日不再重复）；sent=false 发送失败，等待下一小时重试
+    let reminderState = null;
+    try {
+      const res = await db.prepare(
+        "SELECT value FROM settings WHERE key = 'expire_reminder_state'"
+      ).first();
+      reminderState = res ? JSON.parse(res.value) : null;
+    } catch (e) {
+      reminderState = null;
+    }
+    const sentToday = reminderState?.date === todaySerial && reminderState?.sent === true;
+    const failedToday = reminderState?.date === todaySerial && reminderState?.sent === false;
+
+    // 到达配置的提醒时间，或当天此前发送失败需要重试时才继续
+    if (options?.scheduled && !isExpireNotificationTimeDue(siteSettings, now) && !failedToday) {
+      return false;
+    }
+
+    const allServers = await getAllServers(db);
+    const reminderDays = getExpireReminderDays(siteSettings.expire_reminder);
+    const renewedServers = [];
+
+    // 先完成自动续费遍历，确保即使当天已发送过到期提醒（sentToday），新到期的自动续费机器仍能按时推进账期
     for (const s of allServers) {
       if (!s.expire_date) continue;
 
       const billingCycle = normalizeBillingCycle(detectBillingCycle(s.price) || s.billing_cycle);
       // 续费时机 = 到期日 - min(提醒天数, 5)，最长提前 5 天
-      const renewal = renewExpireDateIfNeeded(s.expire_date, billingCycle, s.auto_renewal, now, Math.min(reminderDays, 5));
+      const renewal = renewExpireDateIfNeeded(
+        s.expire_date,
+        billingCycle,
+        s.auto_renewal,
+        now,
+        Math.min(reminderDays, 5),
+        { referenceDateStr }
+      );
       if (renewal.renewed) {
         await db.prepare(
           'UPDATE servers SET expire_date = ?, billing_cycle = ? WHERE id = ?'
@@ -1351,22 +1811,6 @@ export async function checkExpiringServers(db, options = {}) {
         renewedServers.push({ name: s.name, expire_date: renewal.expire_date });
         debug(`[Cron] 服务器 ${s.name} 已自动续费，到期日期更新为 ${s.expire_date}`);
       }
-
-      // 勾选自动续费的节点只走「续费成功」提醒，不计入到期提醒
-      if (isEnabledFlag(s.auto_renewal)) continue;
-
-      if (!shouldNotify) continue;
-
-      const expireDateSerial = parseDateSerial(s.expire_date);
-      if (!Number.isFinite(expireDateSerial) || !Number.isFinite(currentDateSerial)) continue;
-
-      const days = expireDateSerial - currentDateSerial;
-
-      debug(`[Cron] 检测到服务器 ${s.name} 到期日期 ${s.expire_date}，剩余天数 ${days} 天`);
-
-      if (days > 0 && days <= reminderDays) {
-        expiringServers.push({ name: s.name, expire_date: s.expire_date, days });
-      }
     }
 
     const messages = getNotificationMessages(siteSettings);
@@ -1375,36 +1819,85 @@ export async function checkExpiringServers(db, options = {}) {
 
       // 续费成功提醒：与「到期提醒」开关解耦，只要配置了通知渠道就发送
       if (hasNotificationTarget(siteSettings)) {
-        const renewalList = renewedServers.map(s => `${s.name}  ${messages.renewedUntil(s.expire_date)}`).join('\n');
-        debug(`[Cron] 发送自动续费成功通知: ${renewalList}`);
-        try {
-          await sendNotification(siteSettings, renewalList, {
+        const renewalChunks = splitNotificationEntries(
+          renewedServers.map(s => ({
+            text: `${s.name}  ${messages.renewedUntil(s.expire_date)}`,
+            client: s.name,
+            item: s
+          })),
+          NOTIFICATION_CHUNK_MAX_CHARS
+        );
+        for (const chunk of renewalChunks) {
+          debug(`[Cron] 发送自动续费成功通知: ${chunk.text}`);
+          const err = await sendNotification(siteSettings, chunk.text, {
             event: messages.events.renewed,
             emoji: '✅',
-            clients: renewedServers.map(s => s.name),
-            count: renewedServers.length,
-            message: renewalList
+            clients: chunk.clients,
+            count: chunk.count,
+            message: chunk.text
           });
-        } catch (e) {
-          console.error('自动续费成功通知发送失败:', e);
+          if (err) {
+            console.error('自动续费成功通知发送失败:', err);
+          }
         }
       }
     }
 
+    if (sentToday) {
+      return false;
+    }
+
+    const expiringServers = [];
+    const shouldNotify = reminderDays > 0 && hasNotificationTarget(siteSettings);
+    const currentDateSerial = getZonedDateSerial(now, siteSettings.notification_timezone);
+
+    for (const s of allServers) {
+      if (!s.expire_date) continue;
+      // 勾选自动续费的节点只走「续费成功」提醒，不计入到期提醒
+      if (isEnabledFlag(s.auto_renewal)) continue;
+      if (!shouldNotify) continue;
+
+      const expireDateSerial = parseDateSerial(s.expire_date);
+      if (!Number.isFinite(expireDateSerial) || !Number.isFinite(currentDateSerial)) continue;
+
+      const days = expireDateSerial - currentDateSerial;
+      debug(`[Cron] 检测到服务器 ${s.name} 到期日期 ${s.expire_date}，剩余天数 ${days} 天`);
+
+      if (days > 0 && days <= reminderDays) {
+        expiringServers.push({ name: s.name, expire_date: s.expire_date, days });
+      }
+    }
+
     if (expiringServers.length > 0) {
-      const serverList = expiringServers.map(s => `${s.name}  ${messages.daysLeft(s.days)}  ${s.expire_date}`).join('\n');
-      const msg = serverList;
-      debug(`[Cron] 发送到期提醒通知: ${msg}`);
-      try {
-        await sendNotification(siteSettings, msg, {
+      const expiringChunks = splitNotificationEntries(
+        expiringServers.map(s => ({
+          text: `${s.name}  ${messages.daysLeft(s.days)}  ${s.expire_date}`,
+          client: s.name,
+          item: s
+        })),
+        NOTIFICATION_CHUNK_MAX_CHARS
+      );
+      let allSent = true;
+      for (const chunk of expiringChunks) {
+        debug(`[Cron] 发送到期提醒通知: ${chunk.text}`);
+        const err = await sendNotification(siteSettings, chunk.text, {
           event: messages.events.expiring,
           emoji: '⚠️',
-          clients: expiringServers.map(s => s.name),
-          count: expiringServers.length,
-          message: serverList
+          clients: chunk.clients,
+          count: chunk.count,
+          message: chunk.text
         });
+        if (err) {
+          allSent = false;
+          console.error('服务器到期提醒通知发送失败，下一小时重试:', err);
+        }
+      }
+      try {
+        await db.prepare(
+          "INSERT INTO settings (key, value) VALUES ('expire_reminder_state', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+        ).bind(JSON.stringify({ date: todaySerial, sent: allSent })).run();
       } catch (e) {
-        console.error('服务器到期提醒通知发送失败:', e);
+        console.error('写入到期提醒状态失败:', e);
       }
     }
     return true;

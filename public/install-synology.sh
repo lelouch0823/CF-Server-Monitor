@@ -1,15 +1,14 @@
 #!/bin/bash
 # ==============================================================================
-# CF-Server-Monitor 安装/卸载脚本 (Synology 群晖专用版)
+# CF-Server-Monitor 安装/卸载脚本 (Synology 群晖安全加固版)
 # 支持: Synology DSM 6.x / 7.x (BusyBox 环境适配)
-# 与 install.sh 功能一致，针对群晖系统做了路径、服务管理、命令兼容性适配
 # ==============================================================================
 
 set -euo pipefail
+export LC_ALL=C LANG=C
 
 AGENT_VERSION="1.3.8"
 
-# 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -17,7 +16,6 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-# 路径定义（群晖适配）
 SERVICE_NAME="cf-probe"
 SYNOLOGY_RC_DIR="/usr/local/etc/rc.d"
 RC_FILE="${SYNOLOGY_RC_DIR}/${SERVICE_NAME}.sh"
@@ -32,7 +30,6 @@ CONTAINER_PID_FILE="/var/run/cf-probe.pid"
 CONTAINER_LOG_FILE="/var/log/cf-probe.log"
 DEBUG_ENV_FILE="/var/run/cf-probe-debug.env"
 
-# 全局运行模式: synology
 RUNTIME_MODE="synology"
 
 print_banner() {
@@ -49,12 +46,13 @@ step() { echo -e "${BLUE}[→]${NC} $1"; }
 print_usage() {
     echo -e "${RED}错误: 运行所需的入参不完整。${NC}\n"
     echo "用法:"
+    echo "  CF_PROBE_SECRET=xxx bash $0 install -id=SERVER_ID -url=WORKER_URL [选项]"
     echo "  bash $0 install -id=SERVER_ID -secret=SECRET -url=WORKER_URL [选项]"
     echo ""
     echo "必需参数:"
     echo "  -id=xxx        服务器ID"
-    echo "  -secret=xxx    密钥"
-    echo "  -url=xxx       上报地址"
+    echo "  -secret=xxx    密钥（推荐通过环境变量 CF_PROBE_SECRET 传入以避免出现在进程列表中）"
+    echo "  -url=xxx       上报地址（必须以 https:// 或 http:// 开头）"
     echo ""
     echo "可选参数:"
     echo "  -interval=N    上报间隔(秒)，默认60"
@@ -63,22 +61,50 @@ print_usage() {
     echo "  -cu=HOST       自定义CU测试节点"
     echo "  -cm=HOST       自定义CM测试节点"
     echo "  -bd=HOST       自定义BD测试节点"
-    echo "  -interface=IFACES 指定网卡统计，多个用英文逗号分隔，默认自动汇总"
+    echo "  -interface=IFACES 指定网卡统计，多个用英文逗号分隔，默认自动汇总物理网卡"
     echo "  -reset_day=N   流量重置日(1-31, 0=不重置)，默认1"
     echo "  -auto_update=0|1 自动更新探针，默认0"
     echo "  -rx_correction=N  下行流量校正(GB)，覆盖当月下行数据"
     echo "  -tx_correction=N  上行流量校正(GB)，覆盖当月上行数据"
     echo "  -debug=0|1     输出上报调试日志，默认0，不写入配置"
-    echo ""
-    echo "示例:"
-    echo "  bash $0 install -id=server123 -secret=abc123 -url=https://worker.example.com"
-    echo "  bash $0 install -id=server123 -secret=abc123 -url=https://worker.example.com -interval=30"
-    echo "  bash $0 install -id=server123 -secret=abc123 -url=https://worker.example.com -ct=ct.example.com -cu=cu.example.com"
-    echo "  bash $0 install -id=server123 -secret=abc123 -url=https://worker.example.com -interface=eth0,bond0"
-    echo "  bash $0 install -id=server123 -secret=abc123 -url=https://worker.example.com -reset_day=15"
-    echo "  bash $0 install -id=server123 -secret=abc123 -url=https://worker.example.com -rx_correction=10 -tx_correction=5"
-    echo "  bash $0 install -id=server123 -secret=abc123 -url=https://worker.example.com -debug=1"
     exit 1
+}
+
+validate_worker_url() {
+    local url="${1:-}"
+    [ "${#url}" -ge 8 ] || return 1
+    case "$url" in
+        https://?*|http://?*) ;;
+        *) return 1 ;;
+    esac
+    case "$url" in
+        *[[:space:][:cntrl:]\"\'\\\`]*) return 1 ;;
+    esac
+    return 0
+}
+
+ensure_secure_config_dir() {
+    (umask 077; mkdir -p "${CONFIG_DIR}")
+    if [ ! -d "${CONFIG_DIR}" ] || [ -L "${CONFIG_DIR}" ]; then
+        error "配置目录异常（非目录或存在符号链接）: ${CONFIG_DIR}"
+    fi
+    chmod 700 "${CONFIG_DIR}"
+}
+
+atomic_write_file() {
+    local target="$1"
+    local dir
+    dir=$(dirname "$target")
+    (umask 077; mkdir -p "$dir")
+    local tmp
+    tmp=$(umask 077; mktemp "${target}.tmp.XXXXXX") || error "无法创建临时文件: ${target}"
+    if (umask 077; cat > "$tmp"); then
+        chmod 600 "$tmp" 2>/dev/null || true
+        mv -f "$tmp" "$target"
+    else
+        rm -f "$tmp"
+        error "写入文件失败: ${target}"
+    fi
 }
 
 normalize_binary_value() {
@@ -88,6 +114,15 @@ normalize_binary_value() {
         0|1) printf '%s' "$value" ;;
         *) return 1 ;;
     esac
+}
+
+is_valid_correction_value() {
+    local val="${1:-}"
+    case "$val" in
+        ''|*[!0-9.]*|.*|*.) return 1 ;;
+        *.*.*) return 1 ;;
+    esac
+    awk -v v="$val" -v max="${MAX_TRAFFIC_CORRECTION_GB:-1000000}" 'BEGIN { exit !(v ~ /^[0-9]+([.][0-9]+)?$/ && v + 0 >= 0 && v + 0 <= max) }'
 }
 
 normalize_interface_list() {
@@ -111,6 +146,7 @@ normalize_interface_list() {
         }'
 }
 
+# 排除 docker*/veth*，当存在物理口 eth*/en*/wl* 时不重复累加其上层 ovs_*/bond*
 get_configured_net_bytes() {
     local interfaces
     interfaces=$(normalize_interface_list "${1:-}") || interfaces=""
@@ -124,11 +160,26 @@ get_configured_net_bytes() {
             sub(/:$/, "", iface)
             if (interfaces != "") {
                 if (wanted[iface]) { rx += $2; tx += $10 }
-            } else if ($1 ~ /^(eth|en|wl|bond|docker|veth|ovs_)/) {
-                rx += $2; tx += $10
+            } else if (iface ~ /^(docker|veth|br-|virbr|lo|tun|tap|wg|sit)/) {
+                next
+            } else if (iface ~ /^(eth|en|wl)[a-z0-9]*$/) {
+                has_phys = 1
+                phys_rx += $2
+                phys_tx += $10
+            } else if (iface ~ /^(bond|ovs_)[a-z0-9_]*$/) {
+                agg_rx += $2
+                agg_tx += $10
             }
         }
-        END { printf "%.0f %.0f\n", rx+0, tx+0 }
+        END {
+            if (interfaces != "") {
+                printf "%.0f %.0f\n", rx + 0, tx + 0
+            } else if (has_phys) {
+                printf "%.0f %.0f\n", phys_rx + 0, phys_tx + 0
+            } else {
+                printf "%.0f %.0f\n", agg_rx + 0, agg_tx + 0
+            }
+        }
     ' /proc/net/dev 2>/dev/null || echo "0 0"
 }
 
@@ -148,7 +199,6 @@ check_synology() {
 }
 
 detect_os() {
-    # 群晖 BusyBox 环境，包管理器有限
     if command -v synopkg >/dev/null 2>&1; then
         PKG_MGR="synopkg"
     elif command -v opkg >/dev/null 2>&1; then
@@ -168,7 +218,6 @@ detect_os() {
 
 install_deps() {
     step "检查系统依赖组件..."
-    # 群晖 BusyBox 已内置大部分基础命令，重点检查 curl
     local required_cmds="curl awk grep sed ps df ping"
 
     for cmd in ${required_cmds}; do
@@ -191,7 +240,6 @@ install_deps() {
         fi
     done
 
-    # 群晖环境下 nc 可能不存在，作为可选依赖
     if ! command -v nc >/dev/null 2>&1; then
         warn "nc (netcat) 不可用，探针将使用 ICMP ping 模式"
     fi
@@ -199,32 +247,48 @@ install_deps() {
     info "基础依赖组件检查通过"
 }
 
+kill_matching_processes() {
+    local pattern="$1"
+    local self_pid="$$"
+    local parent_pid="${PPID:-0}"
+    (ps -eo pid=,args= 2>/dev/null || ps -ww 2>/dev/null || ps 2>/dev/null) | PAT="$pattern" awk -v sp="$self_pid" -v pp="$parent_pid" '
+        $1 ~ /^[0-9]+$/ && $1 != sp && $1 != pp && index($0, ENVIRON["PAT"]) > 0 { print $1 }
+    ' | while IFS= read -r _pid; do
+        [ -n "$_pid" ] && kill -9 "$_pid" 2>/dev/null || true
+    done
+}
+
 stop_old_service() {
     step "清理可能存在的旧服务进程..."
-    # 尝试停止 RC 脚本
     if [ -f "${RC_FILE}" ]; then
         "${RC_FILE}" stop 2>/dev/null || true
     fi
-    # 清理 PID 文件
     if [ -f "${CONTAINER_PID_FILE}" ]; then
         local old_pid
         old_pid=$(cat "${CONTAINER_PID_FILE}" 2>/dev/null || echo "")
-        if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
-            kill "$old_pid" 2>/dev/null || true
-        fi
+        case "$old_pid" in
+            ''|*[!0-9]*) ;;
+            *)
+                if kill -0 "$old_pid" 2>/dev/null; then
+                    kill "$old_pid" 2>/dev/null || true
+                fi
+                ;;
+        esac
         rm -f "${CONTAINER_PID_FILE}"
     fi
-    if pgrep -f "${SERVICE_NAME}.sh" >/dev/null 2>&1; then
-        pkill -9 -f "${SERVICE_NAME}.sh" 2>/dev/null || true
-    fi
+    kill_matching_processes "${SCRIPT_FILE}"
 }
 
 create_script() {
     step "注入工业级监控采集探针..."
+    mkdir -p /usr/local/bin 2>/dev/null || true
 
-    cat << 'PROBE_EOF' | sed "s|__AGENT_VERSION__|${AGENT_VERSION}|g" > "${SCRIPT_FILE}"
+    local script_tmp
+    script_tmp=$(umask 077; mktemp "${SCRIPT_FILE}.tmp.XXXXXX")
+    cat << 'PROBE_EOF' | sed "s|__AGENT_VERSION__|${AGENT_VERSION}|g" > "${script_tmp}"
 #!/bin/bash
 set +eu
+export LC_ALL=C LANG=C
 
 AGENT_VERSION="__AGENT_VERSION__"
 SERVICE_NAME="cf-probe"
@@ -232,7 +296,82 @@ CONFIG_DIR="/usr/local/etc/cf-probe"
 CONFIG_FILE="${CONFIG_DIR}/config.conf"
 TRAFFIC_DATA_FILE="${CONFIG_DIR}/traffic.dat"
 MAX_TRAFFIC_CORRECTION_GB=1000000
+AUTO_UPDATE_DELAY_SECONDS=60
 DEBUG_MODE=0
+
+verify_secure_dir() {
+    local dir="$1"
+    (umask 077; mkdir -p "$dir" 2>/dev/null) || return 1
+    [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
+    local cur_uid owner_uid
+    cur_uid=$(id -u)
+    owner_uid=$(stat -c '%u' "$dir" 2>/dev/null || true)
+    case "$owner_uid" in
+        ''|*[!0-9]*) owner_uid="" ;;
+    esac
+    if [ -z "$owner_uid" ]; then
+        owner_uid=$(ls -ldn "$dir" 2>/dev/null | awk 'NR==1 {print $3}')
+        case "$owner_uid" in
+            ''|*[!0-9]*) owner_uid="" ;;
+        esac
+    fi
+    [ -n "$owner_uid" ] && [ "$owner_uid" = "$cur_uid" ] || return 1
+    chmod 700 "$dir" 2>/dev/null || return 1
+    return 0
+}
+
+init_secure_run_dir() {
+    if [ "$(id -u)" = "0" ] && [ -d /run ] && [ ! -L /run ]; then
+        if verify_secure_dir "/run/cf-probe"; then
+            RUN_DIR="/run/cf-probe"
+            return 0
+        fi
+    fi
+    if [ "$(id -u)" = "0" ] && [ -d /var/run ] && [ ! -L /var/run ]; then
+        if verify_secure_dir "/var/run/cf-probe"; then
+            RUN_DIR="/var/run/cf-probe"
+            return 0
+        fi
+    fi
+    if verify_secure_dir "${CONFIG_DIR}/run"; then
+        RUN_DIR="${CONFIG_DIR}/run"
+        return 0
+    fi
+    echo "[ERROR] 无法初始化受保护的专属运行目录" >&2
+    exit 1
+}
+
+validate_worker_url() {
+    local url="${1:-}"
+    [ "${#url}" -ge 8 ] || return 1
+    case "$url" in
+        https://?*|http://?*) ;;
+        *) return 1 ;;
+    esac
+    case "$url" in
+        *[[:space:][:cntrl:]\"\'\\\`]*) return 1 ;;
+    esac
+    return 0
+}
+
+run_with_timeout() {
+    local sec="$1"
+    shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$sec" "$@"
+    else
+        "$@"
+    fi
+}
+
+safe_df_kp() {
+    local out
+    if out=$(run_with_timeout 5 df -lkP "$@" 2>/dev/null) && [ -n "$out" ]; then
+        printf '%s\n' "$out"
+        return 0
+    fi
+    run_with_timeout 5 df -kP "$@" 2>/dev/null || true
+}
 
 normalize_interface_list() {
     printf '%s' "${1:-}" | awk -F',' '
@@ -270,6 +409,22 @@ if [ ! -f "${CONFIG_FILE}" ]; then
     exit 1
 fi
 
+SERVER_ID=""
+SECRET=""
+WORKER_URL=""
+COLLECT_INTERVAL=""
+REPORT_INTERVAL=""
+CT_NODE=""
+CU_NODE=""
+CM_NODE=""
+BD_NODE=""
+INTERFACE=""
+RESET_DAY=""
+AUTO_UPDATE=""
+CONFIG_MD5=""
+ALLOW_INSECURE_HTTP_UPDATE="${ALLOW_INSECURE_HTTP_UPDATE:-0}"
+ALLOW_PRIVATE_PROBE="${ALLOW_PRIVATE_PROBE:-0}"
+
 while IFS='=' read -r key value; do
     case "$key" in
         SERVER_ID) SERVER_ID="${value%\"}"; SERVER_ID="${SERVER_ID#\"}" ;;
@@ -285,8 +440,16 @@ while IFS='=' read -r key value; do
         RESET_DAY) RESET_DAY="${value%\"}"; RESET_DAY="${RESET_DAY#\"}" ;;
         AUTO_UPDATE) AUTO_UPDATE="${value%\"}"; AUTO_UPDATE="${AUTO_UPDATE#\"}" ;;
         CONFIG_MD5) CONFIG_MD5="${value%\"}"; CONFIG_MD5="${CONFIG_MD5#\"}" ;;
+        ALLOW_INSECURE_HTTP_UPDATE) ALLOW_INSECURE_HTTP_UPDATE="${value%\"}"; ALLOW_INSECURE_HTTP_UPDATE="${ALLOW_INSECURE_HTTP_UPDATE#\"}" ;;
+        ALLOW_PRIVATE_PROBE) ALLOW_PRIVATE_PROBE="${value%\"}"; ALLOW_PRIVATE_PROBE="${ALLOW_PRIVATE_PROBE#\"}" ;;
     esac
 done < "${CONFIG_FILE}"
+
+verify_secure_dir "${CONFIG_DIR}" || {
+    echo "[ERROR] 配置目录权限校验失败: ${CONFIG_DIR}"
+    exit 1
+}
+init_secure_run_dir
 
 COLLECT_INTERVAL=${COLLECT_INTERVAL:-0}
 REPORT_INTERVAL=${REPORT_INTERVAL:-60}
@@ -317,10 +480,12 @@ log_info() {
 
 log_debug() {
     [ "$DEBUG_MODE" = "1" ] && echo "[DEBUG] $(log_ts) $*" >&2
+    return 0
 }
 
 log_warn_debug() {
     [ "$DEBUG_MODE" = "1" ] && echo "[WARN] $(log_ts) $*"
+    return 0
 }
 
 PROBE_LOG_FILE=""
@@ -340,7 +505,8 @@ rotate_log_if_needed() {
         : > "$1" 2>/dev/null
         return 0
     fi
-    local _tmp="${1}.rot.$$"
+    local _tmp
+    _tmp=$(umask 077; mktemp "${RUN_DIR}/logrot.XXXXXX" 2>/dev/null) || return 0
     tail -c 102400 "$1" > "$_tmp" 2>/dev/null || { rm -f "$_tmp"; return 0; }
     : > "$1" 2>/dev/null
     cat "$_tmp" >> "$1" 2>/dev/null || true
@@ -348,16 +514,20 @@ rotate_log_if_needed() {
 }
 
 get_install_url() {
+    validate_worker_url "${WORKER_URL:-}" || return 1
     local url rest origin
     url="${WORKER_URL%%\?*}"
     case "$url" in
-        http://*)
-            rest="${url#http://}"
-            origin="http://${rest%%/*}"
-            ;;
         https://*)
             rest="${url#https://}"
             origin="https://${rest%%/*}"
+            ;;
+        http://*)
+            if [ "${ALLOW_INSECURE_HTTP_UPDATE:-0}" != "1" ]; then
+                return 1
+            fi
+            rest="${url#http://}"
+            origin="http://${rest%%/*}"
             ;;
         *)
             return 1
@@ -375,7 +545,7 @@ schedule_agent_update() {
         return 0
     fi
 
-    local now last lock_file install_url
+    local now last lock_file install_url lock_tmp
     lock_file="${CONFIG_DIR}/auto_update.lock"
 
     now=$(date +%s)
@@ -388,23 +558,48 @@ schedule_agent_update() {
         fi
     fi
 
-    mkdir -p "${CONFIG_DIR}" 2>/dev/null || true
+    verify_secure_dir "${CONFIG_DIR}" || return 1
     if ! install_url=$(get_install_url); then
-        log_warn_debug "Auto update skipped: invalid WORKER_URL=${WORKER_URL}"
+        log_warn_debug "Auto update skipped: invalid or non-HTTPS WORKER_URL=${WORKER_URL}"
         return 1
     fi
     log_debug "Auto update requested: install_url=${install_url}"
-    printf '%s\n' "$now" > "$lock_file" 2>/dev/null || true
+    if lock_tmp=$(umask 077; mktemp "${CONFIG_DIR}/.lock.XXXXXX" 2>/dev/null); then
+        printf '%s\n' "$now" > "$lock_tmp" && mv -f "$lock_tmp" "$lock_file" || rm -f "$lock_tmp"
+    fi
 
-    log_debug "Auto update scheduling via nohup: install_url=${install_url}"
-    nohup /bin/bash -c 'sleep "$2"; set -o pipefail; curl -fsSL --connect-timeout 5 -m 30 "$1" | bash -s install' _ "$install_url" "$AUTO_UPDATE_DELAY_SECONDS" >/dev/null 2>&1 &
+    nohup /bin/bash -c '
+        sleep "$3"
+        umask 077
+        tmp=$(mktemp "$2/.auto_update.XXXXXX") || exit 1
+        trap '\''rm -f "$tmp"'\'' EXIT INT TERM
+        case "$1" in
+            https://*)
+                curl -fsSL --proto "=https" --tlsv1.2 --connect-timeout 5 -m 30 -o "$tmp" -- "$1" || exit 1
+                ;;
+            http://*)
+                curl -fsSL --proto "=http,https" --connect-timeout 5 -m 30 -o "$tmp" -- "$1" || exit 1
+                ;;
+            *)
+                exit 1
+                ;;
+        esac
+        [ -s "$tmp" ] || exit 1
+        IFS= read -r first_line < "$tmp" || exit 1
+        case "$first_line" in
+            "#!"/*) ;;
+            *) exit 1 ;;
+        esac
+        /bin/bash "$tmp" install
+    ' _ "$install_url" "${CONFIG_DIR}" "$AUTO_UPDATE_DELAY_SECONDS" >/dev/null 2>&1 &
     log_info "Auto update scheduled after ${AUTO_UPDATE_DELAY_SECONDS}s"
     return 0
 }
 
 persist_dynamic_config() {
-    local tmp_file="${CONFIG_FILE}.tmp.$$"
-    awk \
+    local tmp_file
+    tmp_file=$(umask 077; mktemp "${CONFIG_FILE}.tmp.XXXXXX" 2>/dev/null) || return 1
+    if ! (umask 077; awk \
         -v collect="$1" \
         -v report="$2" \
         -v reset="$3" \
@@ -414,7 +609,7 @@ persist_dynamic_config() {
         -v cm="$7" \
         -v bd="$8" \
         -v iface="$9" '
-        BEGIN { c=0; r=0; p=0; d=0; m=0; tct=0; tcu=0; tcm=0; tbd=0; ni=0 }
+        BEGIN { c=0; r=0; d=0; m=0; tct=0; tcu=0; tcm=0; tbd=0; ni=0 }
         /^COLLECT_INTERVAL=/ { print "COLLECT_INTERVAL=\"" collect "\""; c=1; next }
         /^REPORT_INTERVAL=/ { print "REPORT_INTERVAL=\"" report "\""; r=1; next }
         /^RESET_DAY=/ { print "RESET_DAY=\"" reset "\""; d=1; next }
@@ -436,15 +631,18 @@ persist_dynamic_config() {
             if (!tbd) print "BD_NODE=\"" bd "\""
             if (!ni) print "INTERFACE=\"" iface "\""
         }
-    ' "$CONFIG_FILE" > "$tmp_file" || { rm -f "$tmp_file"; return 1; }
+    ' "$CONFIG_FILE" > "$tmp_file"); then
+        rm -f "$tmp_file"
+        return 1
+    fi
     chmod 600 "$tmp_file" 2>/dev/null || true
-    mv "$tmp_file" "$CONFIG_FILE"
+    mv -f "$tmp_file" "$CONFIG_FILE"
 }
 
 apply_remote_config() {
     local response_file="$1" header_file="$2" body bytes new_md5
-    local new_collect new_report new_reset new_schema new_ct new_cu new_cm new_bd new_interface
-    local new_rx_corr new_tx_corr new_update has_config
+    local new_collect="" new_report="" new_reset="" new_schema="" new_ct="" new_cu="" new_cm="" new_bd="" new_interface=""
+    local new_rx_corr="" new_tx_corr="" new_update="" has_config
 
     bytes=$(wc -c < "$response_file" 2>/dev/null || echo 9999)
     if [ "$bytes" -gt 1024 ]; then
@@ -458,10 +656,6 @@ apply_remote_config() {
         *[!A-Za-z0-9_=\&.,:-]*) log_warn_debug "Remote config rejected: invalid characters body=${body}"; return 1 ;;
     esac
 
-    new_rx_corr=""
-    new_tx_corr=""
-    new_update=""
-    new_interface=""
     IFS='&' read -ra _fields <<< "$body"
     for _f in "${_fields[@]}"; do
         _k="${_f%%=*}"; _v="${_f#*=}"
@@ -545,7 +739,7 @@ apply_remote_config() {
             kill "$WORKER_PID" 2>/dev/null || true
             wait "$WORKER_PID" 2>/dev/null || true
         fi
-        rm -f /dev/shm/.cf_probe_* 2>/dev/null || true
+        rm -f "${RUN_DIR}"/probe_* 2>/dev/null || true
         run_network_worker &
         WORKER_PID=$!
 
@@ -569,6 +763,40 @@ apply_remote_config() {
     return 0
 }
 
+escape_json() {
+    printf '%sX\n' "${1:-}" | tr -d '\000-\007\013\016-\037\177' | awk '
+        BEGIN {
+            bs = sprintf("%c", 92)
+            dq = sprintf("%c", 34)
+            ch_b = sprintf("%c", 8)
+            ch_t = sprintf("%c", 9)
+            ch_n = sprintf("%c", 10)
+            ch_f = sprintf("%c", 12)
+            ch_r = sprintf("%c", 13)
+        }
+        {
+            acc = (NR == 1 ? $0 : acc ch_n $0)
+        }
+        END {
+            acc = substr(acc, 1, length(acc) - 1)
+            out = ""
+            len = length(acc)
+            for (i = 1; i <= len; i++) {
+                c = substr(acc, i, 1)
+                if (c == bs) out = out bs bs
+                else if (c == dq) out = out bs dq
+                else if (c == ch_b) out = out bs "b"
+                else if (c == ch_f) out = out bs "f"
+                else if (c == ch_n) out = out bs "n"
+                else if (c == ch_r) out = out bs "r"
+                else if (c == ch_t) out = out bs "t"
+                else out = out c
+            }
+            printf "%s", out
+        }
+    '
+}
+
 normalize_correction_value() {
     local val="${1:-0}"
     [ -z "$val" ] && val=0
@@ -582,14 +810,16 @@ is_valid_correction_value() {
 }
 
 send_correction_confirm() {
-    local rx_val tx_val payload http_code
+    local rx_val tx_val payload http_code esid esec
     rx_val=$(normalize_correction_value "$1")
     tx_val=$(normalize_correction_value "$2")
     is_valid_correction_value "$rx_val" && is_valid_correction_value "$tx_val" || return 1
-    payload="{\"id\":\"$SERVER_ID\",\"secret\":\"$SECRET\",\"rx_correction\":$rx_val,\"tx_correction\":$tx_val}"
-    http_code=$(curl -sS -o /dev/null -w "%{http_code}" -X POST \
+    esid=$(escape_json "$SERVER_ID")
+    esec=$(escape_json "$SECRET")
+    payload="{\"id\":\"$esid\",\"secret\":\"$esec\",\"rx_correction\":$rx_val,\"tx_correction\":$tx_val}"
+    http_code=$(printf '%s' "$payload" | curl -sS -o /dev/null -w "%{http_code}" -X POST \
         -H "Content-Type: application/json" \
-        -d "$payload" -m 4 --connect-timeout 2 "$WORKER_URL" 2>/dev/null || echo 000)
+        --data-binary @- -m 4 --connect-timeout 2 -- "$WORKER_URL" 2>/dev/null || echo 000)
     case "$http_code" in ''|*[!0-9]*) http_code=000 ;; esac
     if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
         log_info "Traffic correction confirm sent: RX=${rx_val}GB TX=${tx_val}GB"
@@ -610,51 +840,36 @@ apply_traffic_correction() {
     rx_bytes=$(printf '%s' "$rx_val" | awk '{printf "%.0f", $1 * 1024 * 1024 * 1024}')
     tx_bytes=$(printf '%s' "$tx_val" | awk '{printf "%.0f", $1 * 1024 * 1024 * 1024}')
 
-    local saved_rx_prev=0 saved_tx_prev=0 saved_rx_period=0 saved_tx_period=0 saved_last_check=0 saved_period_start=0
+    local saved_period_start=0
     if [ -f "${TRAFFIC_DATA_FILE}" ]; then
         while IFS='=' read -r key value; do
             case "$key" in
-                RX_PREV) saved_rx_prev="${value%%\"*}"; saved_rx_prev="${saved_rx_prev#\"}" ;;
-                TX_PREV) saved_tx_prev="${value%%\"*}"; saved_tx_prev="${saved_tx_prev#\"}" ;;
-                RX_PERIOD) saved_rx_period="${value%%\"*}"; saved_rx_period="${saved_rx_period#\"}" ;;
-                TX_PERIOD) saved_tx_period="${value%%\"*}"; saved_tx_period="${saved_tx_period#\"}" ;;
-                LAST_CHECK) saved_last_check="${value%%\"*}"; saved_last_check="${saved_last_check#\"}" ;;
                 PERIOD_START) saved_period_start="${value%%\"*}"; saved_period_start="${saved_period_start#\"}" ;;
             esac
         done < "${TRAFFIC_DATA_FILE}"
     fi
 
-    local now_ts
+    local now_ts current_net saved_rx_prev saved_tx_prev
     now_ts=$(date +%s)
-    local current_net
     current_net=$(get_net_bytes)
     saved_rx_prev=$(echo "$current_net" | awk '{print $1}'); saved_rx_prev=${saved_rx_prev:-0}
     saved_tx_prev=$(echo "$current_net" | awk '{print $2}'); saved_tx_prev=${saved_tx_prev:-0}
 
-    saved_rx_period=${rx_bytes}
-    saved_tx_period=${tx_bytes}
     log_info "Traffic correction applied: RX=${rx_val}GB (${rx_bytes} bytes) TX=${tx_val}GB (${tx_bytes} bytes)"
 
-    mkdir -p "${CONFIG_DIR}" 2>/dev/null || true
-    cat > "${TRAFFIC_DATA_FILE}.tmp" << EOF
+    local tmp_tf
+    if tmp_tf=$(umask 077; mktemp "${TRAFFIC_DATA_FILE}.tmp.XXXXXX" 2>/dev/null); then
+        cat > "$tmp_tf" << EOF
 RX_PREV=${saved_rx_prev}
 TX_PREV=${saved_tx_prev}
-RX_PERIOD=${saved_rx_period}
-TX_PERIOD=${saved_tx_period}
+RX_PERIOD=${rx_bytes}
+TX_PERIOD=${tx_bytes}
 LAST_CHECK=${now_ts}
 PERIOD_START=${saved_period_start}
 INTERFACE=${INTERFACE:-}
 EOF
-    mv "${TRAFFIC_DATA_FILE}.tmp" "${TRAFFIC_DATA_FILE}" 2>/dev/null || true
-}
-
-escape_json() {
-    local val="${1:-}"
-    val="${val//\\/\\\\}"
-    val="${val//\"/\\\"}"
-    val="${val//$'\n'/ }"
-    val="${val//$'\r'/}"
-    echo -n "$val"
+        mv -f "$tmp_tf" "${TRAFFIC_DATA_FILE}" 2>/dev/null || rm -f "$tmp_tf"
+    fi
 }
 
 json_probe_value() {
@@ -674,8 +889,7 @@ safe_div() {
     if [ "${den}" -eq 0 ]; then echo "${def}"; else echo $(( num / den )); fi
 }
 
-# 群晖 BusyBox 兼容的网络字节获取
-# BusyBox 的 awk 可能不支持某些正则，简化匹配
+# 排除 docker*/veth*，当存在物理口 eth*/en*/wl* 时不重复累加其上层 ovs_*/bond*
 get_net_bytes() {
     local interfaces="${INTERFACE:-}"
     awk -v interfaces="$interfaces" '
@@ -688,11 +902,26 @@ get_net_bytes() {
             sub(/:$/, "", iface)
             if (interfaces != "") {
                 if (wanted[iface]) { rx += $2; tx += $10 }
-            } else if ($1 ~ /^(eth|en|wl|bond|docker|veth|ovs_)/) {
-                rx += $2; tx += $10
+            } else if (iface ~ /^(docker|veth|br-|virbr|lo|tun|tap|wg|sit)/) {
+                next
+            } else if (iface ~ /^(eth|en|wl)[a-z0-9]*$/) {
+                has_phys = 1
+                phys_rx += $2
+                phys_tx += $10
+            } else if (iface ~ /^(bond|ovs_)[a-z0-9_]*$/) {
+                agg_rx += $2
+                agg_tx += $10
             }
         }
-        END { printf "%.0f %.0f\n", rx+0, tx+0 }
+        END {
+            if (interfaces != "") {
+                printf "%.0f %.0f\n", rx + 0, tx + 0
+            } else if (has_phys) {
+                printf "%.0f %.0f\n", phys_rx + 0, phys_tx + 0
+            } else {
+                printf "%.0f %.0f\n", agg_rx + 0, agg_tx + 0
+            }
+        }
     ' /proc/net/dev 2>/dev/null || echo "0 0"
 }
 
@@ -708,7 +937,6 @@ to_decimal() {
     printf '%s' "$value"
 }
 
-# 纯算术计算：给定年月日（UTC）返回 epoch 秒数，不依赖 date -d
 _days_in_month() {
     local y=$1 m=$2
     case "$m" in
@@ -734,12 +962,11 @@ _epoch_from_ymd() {
     echo $((days * 86400))
 }
 
-# BusyBox date 兼容：将 epoch 秒数转换为 UTC 年月日
 _get_utc_ymd() {
     local now_ts="$1"
     awk -v ts="$now_ts" '
     BEGIN {
-        secs = ts; y = 1970
+        secs = ts + 0; y = 1970
         while (1) {
             leap = (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
             days_year = leap ? 366 : 365
@@ -809,11 +1036,9 @@ calc_monthly_traffic() {
     local now_ts
     now_ts=$(date '+%s')
 
-    mkdir -p "${CONFIG_DIR}" 2>/dev/null || true
-
     local saved_rx_prev=0 saved_tx_prev=0 saved_rx_period=0 saved_tx_period=0 saved_last_check=0 saved_period_start=0 saved_interface=""
     if [ -f "${TRAFFIC_DATA_FILE}" ]; then
-        local tmp_rx_prev tmp_tx_prev tmp_rx_period tmp_tx_period tmp_last_check tmp_period_start tmp_interface
+        local tmp_rx_prev="" tmp_tx_prev="" tmp_rx_period="" tmp_tx_period="" tmp_last_check="" tmp_period_start="" tmp_interface=""
         while IFS='=' read -r key value; do
             case "$key" in
                 RX_PREV) tmp_rx_prev="$value" ;;
@@ -861,7 +1086,9 @@ calc_monthly_traffic() {
         saved_tx_period=0
     fi
 
-    cat > "${TRAFFIC_DATA_FILE}.tmp" << EOF
+    local tmp_tf
+    if tmp_tf=$(umask 077; mktemp "${TRAFFIC_DATA_FILE}.tmp.XXXXXX" 2>/dev/null); then
+        cat > "$tmp_tf" << EOF
 RX_PREV=${current_rx}
 TX_PREV=${current_tx}
 RX_PERIOD=${saved_rx_period}
@@ -870,7 +1097,8 @@ LAST_CHECK=${now_ts}
 PERIOD_START=${period_start_ts}
 INTERFACE=${INTERFACE:-}
 EOF
-    mv "${TRAFFIC_DATA_FILE}.tmp" "${TRAFFIC_DATA_FILE}" 2>/dev/null || true
+        mv -f "$tmp_tf" "${TRAFFIC_DATA_FILE}" 2>/dev/null || rm -f "$tmp_tf"
+    fi
 
     echo "$saved_rx_period $saved_tx_period"
 }
@@ -907,20 +1135,21 @@ get_gpu_metrics() {
 
     if command -v nvidia-smi >/dev/null 2>&1; then
         local nvidia_output
-        nvidia_output=$(nvidia-smi --query-gpu=index,name,utilization.gpu --format=csv,noheader,nounits 2>/dev/null || true)
+        nvidia_output=$(run_with_timeout 5 nvidia-smi --query-gpu=index,name,utilization.gpu --format=csv,noheader,nounits 2>/dev/null || true)
         if [ -n "${nvidia_output}" ]; then
             while IFS= read -r nvidia_line; do
                 [ -z "${nvidia_line}" ] && continue
-                local gpu_idx gpu_name gpu_util gpu_name_escaped
+                local gpu_idx gpu_name gpu_util gpu_idx_escaped gpu_name_escaped
                 gpu_idx=$(echo "${nvidia_line}" | awk -F',' '{gsub(/^[ \t]+|[ \t]+$/, "", $1); print $1}')
                 gpu_util=$(echo "${nvidia_line}" | awk -F',' '{gsub(/[^0-9.]/, "", $NF); print $NF}')
                 gpu_name=$(echo "${nvidia_line}" | sed 's/^[^,]*,//; s/,[^,]*$//' | sed 's/^[ \t]*//;s/[ \t]*$//')
                 case "${gpu_util}" in ''|*[!0-9.]*|*.*.*) gpu_util="null" ;; esac
+                gpu_idx_escaped=$(escape_json "${gpu_idx}")
                 gpu_name_escaped=$(escape_json "${gpu_name}")
                 if [ "${gpu_info_array}" != "null" ]; then
-                    gpu_info_array="${gpu_info_array},{\"name\":\"${gpu_name_escaped}\",\"info\":${gpu_util},\"id\":\"${gpu_idx}\"}"
+                    gpu_info_array="${gpu_info_array},{\"name\":\"${gpu_name_escaped}\",\"info\":${gpu_util},\"id\":\"${gpu_idx_escaped}\"}"
                 else
-                    gpu_info_array="{\"name\":\"${gpu_name_escaped}\",\"info\":${gpu_util},\"id\":\"${gpu_idx}\"}"
+                    gpu_info_array="{\"name\":\"${gpu_name_escaped}\",\"info\":${gpu_util},\"id\":\"${gpu_idx_escaped}\"}"
                 fi
                 gpu_count=$((gpu_count + 1))
             done <<EOF
@@ -929,8 +1158,8 @@ EOF
         fi
     elif command -v rocm-smi >/dev/null 2>&1; then
         local rocm_names rocm_utils
-        rocm_names=$(rocm-smi --showproductname 2>/dev/null | awk -F: '/Card series|Card model|Product Name/{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}' || true)
-        rocm_utils=$(rocm-smi --showuse 2>/dev/null | awk -F: '/GPU use/{gsub(/[^0-9.]/, "", $2); print $2}' || true)
+        rocm_names=$(run_with_timeout 5 rocm-smi --showproductname 2>/dev/null | awk -F: '/Card series|Card model|Product Name/{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}' || true)
+        rocm_utils=$(run_with_timeout 5 rocm-smi --showuse 2>/dev/null | awk -F: '/GPU use/{gsub(/[^0-9.]/, "", $2); print $2}' || true)
         local idx=0
         while IFS= read -r rname; do
             [ -z "${rname}" ] && continue
@@ -978,9 +1207,7 @@ EOF
     fi
 }
 
-# BusyBox date 不支持 %N / %3N，纯 awk 实现毫秒级时间戳
 get_time_ms() {
-    # 先尝试系统 date（非 BusyBox 环境可能支持）
     local ts
     ts=$(date +%s%3N 2>/dev/null || true)
     case "${ts}" in
@@ -989,11 +1216,13 @@ get_time_ms() {
         ??????????????*) echo "${ts:0:13}"; return 0 ;;
     esac
 
-    # BusyBox 回退：用 awk 读 /proc/uptime 算毫秒（精度 ~10ms，足够 TCP ping 用）
-    awk '{ms=int($1*1000); printf "%d\n", ms}' /proc/uptime 2>/dev/null && return 0
+    awk '{ms=int($1*1000); printf "%.0f\n", ms}' /proc/uptime 2>/dev/null && return 0
 
-    # 最终回退：只用秒级（精度降级但不会失败）
-    date +%s 2>/dev/null && return 0
+    ts=$(date +%s 2>/dev/null || echo "")
+    if [ -n "$ts" ]; then
+        echo $((ts * 1000))
+        return 0
+    fi
     return 1
 }
 
@@ -1019,6 +1248,18 @@ get_tcp_ping_nc() {
     return 1
 }
 
+is_forbidden_probe_host() {
+    local h
+    h=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')
+    [ "${ALLOW_PRIVATE_PROBE:-0}" = "1" ] && return 1
+    case "$h" in
+        localhost|*.localhost|ip6-localhost|ip6-loopback|127.*|169.254.*|0.0.0.0|0.*|::1|::|fe80:*)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
 split_probe_target() {
     local target="${1:-}"
     local default_port="${2:-443}"
@@ -1027,6 +1268,10 @@ split_probe_target() {
 
     case "$target" in
         ''|*[!A-Za-z0-9._:-]*) return 1 ;;
+        ::1)
+            probe_host="::1"
+            probe_port="$default_port"
+            ;;
         *:*)
             case "${target#*:}" in *:*) return 1 ;; esac
             probe_host="${target%:*}"
@@ -1035,11 +1280,26 @@ split_probe_target() {
     esac
 
     case "$probe_host" in ''|-*) return 1 ;; esac
+    is_forbidden_probe_host "$probe_host" && return 1
     case "$probe_port" in ''|*[!0-9]*|??????*) return 1 ;; esac
     [ "$probe_port" -ge 1 ] && [ "$probe_port" -le 65535 ] || return 1
 
     echo "${probe_host} ${probe_port}"
     return 0
+}
+
+parse_ping_avg() {
+    awk -F'=' '
+        /(^|[[:space:]])(rtt|round-trip)[[:space:]]/ && NF >= 2 {
+            rhs = $2
+            gsub(/^[[:space:]]+/, "", rhs)
+            n = split(rhs, parts, "/")
+            if (n >= 2 && parts[2] ~ /^[0-9]+([.][0-9]+)?$/) {
+                printf "%d", int(parts[2])
+                exit
+            }
+        }
+    '
 }
 
 get_probe() {
@@ -1089,12 +1349,10 @@ get_probe() {
         return
     fi
 
-    # TCP 不可用，回退 ICMP
-    local icmp_out
-    icmp_out=$(ping -c "$count" -W 2 "$host" 2>/dev/null)
-    local avg_rtt loss
-    avg_rtt=$(echo "$icmp_out" | awk -F'[/ ]' '/^rtt/{print $8}' | cut -d. -f1)
-    loss=$(echo "$icmp_out" | awk '/packet loss/{for(i=1;i<=NF;i++) if($i~/[0-9]+%/){gsub(/%/,"",$i);printf "%d",$i;exit}}')
+    local icmp_out avg_rtt loss
+    icmp_out=$(ping -c "$count" -W 2 -- "$host" 2>/dev/null || ping -c "$count" -W 2 "$host" 2>/dev/null || true)
+    avg_rtt=$(printf '%s\n' "$icmp_out" | parse_ping_avg)
+    loss=$(printf '%s\n' "$icmp_out" | awk '/packet loss/{for(i=1;i<=NF;i++) if($i~/^[0-9]+(\.[0-9]+)?%$/){sub(/%/,"",$i);printf "%d",int($i);exit}}')
     [ -z "$avg_rtt" ] && avg_rtt="null"
     [ -z "$loss" ] && loss=100
     echo "$avg_rtt $loss"
@@ -1108,36 +1366,69 @@ BD_NODE="${BD_NODE:-}"
 write_probe_result() {
     local dest="$1"
     shift
-    local tmp="${dest}.tmp"
-    rm -f "$tmp"
+    local tmp
+    tmp=$(umask 077; mktemp "${dest}.XXXXXX" 2>/dev/null) || return 0
     if [ "$DEBUG_MODE" = "1" ]; then
         "$@" > "$tmp" || true
     else
         "$@" > "$tmp" 2>/dev/null || true
     fi
     if [ -s "$tmp" ]; then
-        mv "$tmp" "$dest"
+        mv -f "$tmp" "$dest"
     else
         rm -f "$tmp" "$dest"
     fi
+    return 0
+}
+
+is_valid_ipv4() {
+    local ip="${1:-}"
+    [ "${#ip}" -le 15 ] || return 1
+    printf '%s' "$ip" | awk -F'.' '
+        NF == 4 &&
+        $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ &&
+        $1 + 0 <= 255 && $2 + 0 <= 255 && $3 + 0 <= 255 && $4 + 0 <= 255 { ok = 1 }
+        END { exit !ok }
+    '
+}
+
+is_valid_ipv6() {
+    local ip="${1:-}"
+    [ "${#ip}" -ge 2 ] && [ "${#ip}" -le 45 ] || return 1
+    case "$ip" in
+        *:*) ;;
+        *) return 1 ;;
+    esac
+    case "$ip" in
+        *[!0-9a-fA-F:.]*) return 1 ;;
+    esac
+    return 0
 }
 
 get_cf_trace_ip() {
     local curl_family="$1"
     local ip_value
-    ip_value=$(curl "$curl_family" --noproxy cloudflare.com -s -m 5 --connect-timeout 5 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | awk -F= '$1 == "ip" { print $2; exit }') || ip_value=""
-    if [ -n "$ip_value" ]; then
-        printf '%s\n' "$ip_value"
+    ip_value=$(curl "$curl_family" --noproxy cloudflare.com -s -m 5 --connect-timeout 5 -- "https://cloudflare.com/cdn-cgi/trace" 2>/dev/null | awk -F= '$1 == "ip" { gsub(/[\r\n[:space:]]/, "", $2); print $2; exit }') || ip_value=""
+    if [ "$curl_family" = "-4" ]; then
+        if is_valid_ipv4 "$ip_value"; then
+            printf '%s\n' "$ip_value"
+            return 0
+        fi
     else
-        printf '0\n'
+        if is_valid_ipv6 "$ip_value"; then
+            printf '%s\n' "$ip_value"
+            return 0
+        fi
     fi
+    printf '0\n'
 }
 
 refresh_probe_async() {
-    [ -n "$CT_NODE" ] && write_probe_result /dev/shm/.cf_probe_ct get_probe "$CT_NODE" 4 443
-    [ -n "$CU_NODE" ] && write_probe_result /dev/shm/.cf_probe_cu get_probe "$CU_NODE" 4 443
-    [ -n "$CM_NODE" ] && write_probe_result /dev/shm/.cf_probe_cm get_probe "$CM_NODE" 4 443
-    [ -n "$BD_NODE" ] && write_probe_result /dev/shm/.cf_probe_bd get_probe "$BD_NODE" 4 443
+    [ -n "$CT_NODE" ] && write_probe_result "${RUN_DIR}/probe_ct" get_probe "$CT_NODE" 4 443
+    [ -n "$CU_NODE" ] && write_probe_result "${RUN_DIR}/probe_cu" get_probe "$CU_NODE" 4 443
+    [ -n "$CM_NODE" ] && write_probe_result "${RUN_DIR}/probe_cm" get_probe "$CM_NODE" 4 443
+    [ -n "$BD_NODE" ] && write_probe_result "${RUN_DIR}/probe_bd" get_probe "$BD_NODE" 4 443
+    return 0
 }
 
 run_network_worker() {
@@ -1150,11 +1441,16 @@ run_network_worker() {
     [ "$probe_interval" -gt 60 ] && probe_interval=60
 
     while true; do
-        local now; now=$(date +%s)
+        local now _ipv4_tmp _ipv6_tmp
+        now=$(date +%s)
 
         if [ $((now - last_ip)) -ge 600 ] || [ "$last_ip" -eq 0 ]; then
-            get_cf_trace_ip "-4" > /dev/shm/.cf_ipv4.tmp && mv /dev/shm/.cf_ipv4.tmp /dev/shm/.cf_ipv4 || true
-            (if ip -6 route show default >/dev/null 2>&1; then get_cf_trace_ip "-6"; else echo "0"; fi) > /dev/shm/.cf_ipv6.tmp && mv /dev/shm/.cf_ipv6.tmp /dev/shm/.cf_ipv6 || true
+            if _ipv4_tmp=$(umask 077; mktemp "${RUN_DIR}/.ipv4.XXXXXX" 2>/dev/null); then
+                get_cf_trace_ip "-4" > "$_ipv4_tmp" && mv -f "$_ipv4_tmp" "${RUN_DIR}/ipv4" || rm -f "$_ipv4_tmp"
+            fi
+            if _ipv6_tmp=$(umask 077; mktemp "${RUN_DIR}/.ipv6.XXXXXX" 2>/dev/null); then
+                (if ip -6 route show default >/dev/null 2>&1; then get_cf_trace_ip "-6"; else echo "0"; fi) > "$_ipv6_tmp" && mv -f "$_ipv6_tmp" "${RUN_DIR}/ipv6" || rm -f "$_ipv6_tmp"
+            fi
             last_ip="$now"
         fi
 
@@ -1176,21 +1472,22 @@ PREV_CPU_IDLE=$(echo "$CPU_STAT" | awk '{print $2}'); PREV_CPU_IDLE=${PREV_CPU_I
 
 PREV_LOOP_TIME=$(date +%s)
 
-# 缓存间隔定义
-DISK_CHECK_INTERVAL=120          # 硬盘检测：2分钟
+DISK_CHECK_INTERVAL=120
 LAST_DISK_CHECK=0
-# 状态检测：固定60秒
 STATUS_CHECK_INTERVAL=60
 LAST_STATUS_CHECK=0
 
-# set -u 安全初始化：所有缓存变量在循环前初始化为默认值
 DISK_TOTAL=0; DISK_USED=0
 OS=""; ARCH=""; KERNEL_VERSION=""; BOOT_TIME=0; CPU_INFO=""; CPU_CORES=1
 GPU_INFO_VALUE="null"; LOAD_AVG="0 0 0"; PROCESSES=0; TCP_CONN=0; UDP_CONN=0
 RX_MONTHLY=0; TX_MONTHLY=0
 
 if [ -z "${SERVER_ID:-}" ] || [ -z "${SECRET:-}" ] || [ -z "${WORKER_URL:-}" ]; then
-    echo "[ERROR] $(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%d %H:%M:%S') 配置缺失: SERVER_ID/SECRET/WORKER_URL 不能为空"
+    echo "[ERROR] $(log_ts) 配置缺失: SERVER_ID/SECRET/WORKER_URL 不能为空"
+    exit 1
+fi
+if ! validate_worker_url "${WORKER_URL}"; then
+    echo "[ERROR] $(log_ts) WORKER_URL 非法: 必须以 https:// 或 http:// 开头且不含空白或引号"
     exit 1
 fi
 
@@ -1214,7 +1511,6 @@ while true; do
         WORKER_PID=$!
     fi
 
-    # 群晖内存采集 - BusyBox 兼容
     MEM_TOTAL_KB=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0); MEM_TOTAL_KB=${MEM_TOTAL_KB:-0}
     MEM_AVAIL_KB=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0); MEM_AVAIL_KB=${MEM_AVAIL_KB:-0}
     if [ "${MEM_AVAIL_KB}" -eq 0 ]; then
@@ -1233,10 +1529,9 @@ while true; do
     SWAP_USED=$(((SWAP_TOTAL_KB - SWAP_FREE_KB) / 1024))
     [ "${SWAP_USED}" -lt 0 ] && SWAP_USED=0
 
-    # 群晖磁盘采集 - 包含 DSM 存储池（缓存机制：每2分钟检测一次）
     if [ $((LOOP_START_TIME - LAST_DISK_CHECK)) -ge "${DISK_CHECK_INTERVAL}" ] || [ "${LAST_DISK_CHECK}" -eq 0 ]; then
         DISK_TOTAL=0; DISK_USED=0
-        DISK_STATS=$(df -kP 2>/dev/null | awk '
+        DISK_STATS=$(safe_df_kp | awk '
             NR>1 &&
             $1 !~ /^\/dev\/loop/ &&
             $6 !~ /^(\/boot|\/boot\/efi|\/snap|\/var\/snap|\/@dev|\/@tmp|\/@shared)/ &&
@@ -1273,14 +1568,11 @@ while true; do
     PREV_CPU_TOTAL=${CPU_TOTAL_NOW}
     PREV_CPU_IDLE=${CPU_IDLE_NOW}
 
-    # 获取网络字节数（网速计算需要每次执行，流量统计也需要）
     NET_STAT=$(get_net_bytes)
     RX_NOW=$(echo "$NET_STAT" | awk '{print $1}'); RX_NOW=${RX_NOW:-0}
     TX_NOW=$(echo "$NET_STAT" | awk '{print $2}'); TX_NOW=${TX_NOW:-0}
 
-    # 静态信息（仅首次运行时获取，运行期间不会变化）
     if [ "${LAST_STATUS_CHECK}" -eq 0 ]; then
-        # 群晖 OS 信息获取
         if [ -f /etc/synoinfo.conf ]; then
             SYNO_DSM_VER=$(grep 'productversion' /etc/synoinfo.conf 2>/dev/null | cut -d'"' -f2 || echo "")
             SYNO_MODEL=$(grep 'upnpmodelname' /etc/synoinfo.conf 2>/dev/null | cut -d'"' -f2 || echo "")
@@ -1292,7 +1584,7 @@ while true; do
                 OS="Synology NAS"
             fi
         elif [ -f /etc/os-release ]; then
-            OS_RAW=$(grep -E '^PRETTY_NAME=' /etc/os-release | cut -d= -f2 | tr -d '"' | tr -d "'")
+            OS_RAW=$(grep -E '^PRETTY_NAME=' /etc/os-release | cut -d= -f2 | tr -d '"' | tr -d "'" || true)
             OS=${OS_RAW:-"Linux"}
         else
             OS=$(uname -srm)
@@ -1313,26 +1605,23 @@ while true; do
             fi
         fi
 
-        # CPU 型号获取 - 群晖兼容
         CPU_INFO=""
         if [ -f /proc/cpuinfo ]; then
-            CPU_INFO=$(grep -m 1 'model name' /proc/cpuinfo 2>/dev/null | awk -F: '{print $2}' | xargs || echo "")
+            CPU_INFO=$(awk '/model name/ { val = substr($0, index($0, ":") + 1); gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", val); print val; exit }' /proc/cpuinfo 2>/dev/null || echo "")
         fi
         [ -z "${CPU_INFO}" ] && CPU_INFO=${ARCH}
 
-        # 核心数 - BusyBox 兼容
         CPU_CORES=$(nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo "1")
     fi
 
-    # 状态检测缓存：进程数、连接数、GPU使用率、负载、当月累计流量（每STATUS_CHECK_INTERVAL检测一次）
     if [ $((LOOP_START_TIME - LAST_STATUS_CHECK)) -ge "${STATUS_CHECK_INTERVAL}" ] || [ "${LAST_STATUS_CHECK}" -eq 0 ]; then
         GPU_INFO_VALUE=$(get_gpu_metrics)
         [ -z "${GPU_INFO_VALUE}" ] && GPU_INFO_VALUE="null"
 
         LOAD_AVG=$(awk '{print $1, $2, $3}' /proc/loadavg 2>/dev/null); LOAD_AVG=${LOAD_AVG:-"0 0 0"}
         PROCESSES=$(ps -e 2>/dev/null | wc -l || echo 0)
+        PROCESSES=$(printf '%s' "${PROCESSES:-0}" | tr -d ' \t\r\n')
 
-        # TCP - BusyBox 兼容
         TCP_CONN=""
         if command -v ss >/dev/null 2>&1; then
             TCP_CONN=$(ss -H -ant state established 2>/dev/null | wc -l)
@@ -1341,7 +1630,6 @@ while true; do
         fi
         TCP_CONN=$(printf "%s" "${TCP_CONN:-0}" | tr -d '\r\n ')
 
-        # UDP - BusyBox 兼容
         UDP_CONN=""
         if command -v ss >/dev/null 2>&1; then
             UDP_CONN=$(ss -H -anu 2>/dev/null | wc -l)
@@ -1350,7 +1638,6 @@ while true; do
         fi
         UDP_CONN=$(printf "%s" "${UDP_CONN:-0}" | tr -d '\r\n ')
 
-        # 计算当月累计流量
         MONTHLY_TRAFFIC=$(calc_monthly_traffic "$RX_NOW" "$TX_NOW")
         RX_MONTHLY=$(echo "$MONTHLY_TRAFFIC" | awk '{print $1}')
         TX_MONTHLY=$(echo "$MONTHLY_TRAFFIC" | awk '{print $2}')
@@ -1373,17 +1660,25 @@ while true; do
     TX_PREV=${TX_NOW}
     PREV_LOOP_TIME=${LOOP_START_TIME}
 
-    [ -f /dev/shm/.cf_ipv4 ] && IPV4=$(cat /dev/shm/.cf_ipv4) || IPV4="0"
-    [ -f /dev/shm/.cf_ipv6 ] && IPV6=$(cat /dev/shm/.cf_ipv6) || IPV6="0"
-    if [ -f /dev/shm/.cf_probe_ct ]; then _p=$(cat /dev/shm/.cf_probe_ct); PING_CT=${_p%% *}; LOSS_CT=${_p##* }; else PING_CT=""; LOSS_CT=""; fi
-    if [ -f /dev/shm/.cf_probe_cu ]; then _p=$(cat /dev/shm/.cf_probe_cu); PING_CU=${_p%% *}; LOSS_CU=${_p##* }; else PING_CU=""; LOSS_CU=""; fi
-    if [ -f /dev/shm/.cf_probe_cm ]; then _p=$(cat /dev/shm/.cf_probe_cm); PING_CM=${_p%% *}; LOSS_CM=${_p##* }; else PING_CM=""; LOSS_CM=""; fi
-    if [ -f /dev/shm/.cf_probe_bd ]; then _p=$(cat /dev/shm/.cf_probe_bd); PING_BD=${_p%% *}; LOSS_BD=${_p##* }; else PING_BD=""; LOSS_BD=""; fi
+    [ -f "${RUN_DIR}/ipv4" ] && IPV4=$(cat "${RUN_DIR}/ipv4" 2>/dev/null || echo "0") || IPV4="0"
+    [ -f "${RUN_DIR}/ipv6" ] && IPV6=$(cat "${RUN_DIR}/ipv6" 2>/dev/null || echo "0") || IPV6="0"
+    is_valid_ipv4 "$IPV4" || IPV4="0"
+    is_valid_ipv6 "$IPV6" || IPV6="0"
 
+    if [ -f "${RUN_DIR}/probe_ct" ]; then _p=$(cat "${RUN_DIR}/probe_ct" 2>/dev/null || echo ""); PING_CT=${_p%% *}; LOSS_CT=${_p##* }; else PING_CT=""; LOSS_CT=""; fi
+    if [ -f "${RUN_DIR}/probe_cu" ]; then _p=$(cat "${RUN_DIR}/probe_cu" 2>/dev/null || echo ""); PING_CU=${_p%% *}; LOSS_CU=${_p##* }; else PING_CU=""; LOSS_CU=""; fi
+    if [ -f "${RUN_DIR}/probe_cm" ]; then _p=$(cat "${RUN_DIR}/probe_cm" 2>/dev/null || echo ""); PING_CM=${_p%% *}; LOSS_CM=${_p##* }; else PING_CM=""; LOSS_CM=""; fi
+    if [ -f "${RUN_DIR}/probe_bd" ]; then _p=$(cat "${RUN_DIR}/probe_bd" 2>/dev/null || echo ""); PING_BD=${_p%% *}; LOSS_BD=${_p##* }; else PING_BD=""; LOSS_BD=""; fi
+
+    ESERVER_ID=$(escape_json "${SERVER_ID}")
+    ESECRET=$(escape_json "${SECRET}")
     EOS=$(escape_json "${OS}")
     EARCH=$(escape_json "${ARCH}")
     ECPU=$(escape_json "${CPU_INFO}")
     EKERNEL=$(escape_json "${KERNEL_VERSION}")
+    ELOAD=$(escape_json "${LOAD_AVG}")
+    EIPV4=$(escape_json "${IPV4}")
+    EIPV6=$(escape_json "${IPV6}")
     PING_CT_JSON=$(json_probe_value "$CT_NODE" "$PING_CT")
     PING_CU_JSON=$(json_probe_value "$CU_NODE" "$PING_CU")
     PING_CM_JSON=$(json_probe_value "$CM_NODE" "$PING_CM")
@@ -1394,7 +1689,7 @@ while true; do
     LOSS_BD_JSON=$(json_probe_value "$BD_NODE" "$LOSS_BD")
 
     METRICS_JSON=$(cat <<EOF
-{"cpu":"$CPU","ram_total":"$RAM_TOTAL","ram_used":"$RAM_USED","swap_total":"$SWAP_TOTAL","swap_used":"$SWAP_USED","disk_total":"$DISK_TOTAL","disk_used":"$DISK_USED","load_avg":"$LOAD_AVG","boot_time":"$BOOT_TIME","net_rx":"$RX_NOW","net_tx":"$TX_NOW","net_rx_monthly":"$RX_MONTHLY","net_tx_monthly":"$TX_MONTHLY","net_in_speed":"$RX_SPEED","net_out_speed":"$TX_SPEED","os":"$EOS","arch":"$EARCH","kernel_version":"$EKERNEL","cpu_info":"$ECPU","cpu_cores":"$CPU_CORES","gpu_info":$GPU_INFO_VALUE,"processes":"$PROCESSES","tcp_conn":"$TCP_CONN","udp_conn":"$UDP_CONN","ip_v4":"$IPV4","ip_v6":"$IPV6","ping_ct":$PING_CT_JSON,"ping_cu":$PING_CU_JSON,"ping_cm":$PING_CM_JSON,"ping_bd":$PING_BD_JSON,"loss_ct":$LOSS_CT_JSON,"loss_cu":$LOSS_CU_JSON,"loss_cm":$LOSS_CM_JSON,"loss_bd":$LOSS_BD_JSON}
+{"cpu":"$CPU","ram_total":"$RAM_TOTAL","ram_used":"$RAM_USED","swap_total":"$SWAP_TOTAL","swap_used":"$SWAP_USED","disk_total":"$DISK_TOTAL","disk_used":"$DISK_USED","load_avg":"$ELOAD","boot_time":"$BOOT_TIME","net_rx":"$RX_NOW","net_tx":"$TX_NOW","net_rx_monthly":"$RX_MONTHLY","net_tx_monthly":"$TX_MONTHLY","net_in_speed":"$RX_SPEED","net_out_speed":"$TX_SPEED","os":"$EOS","arch":"$EARCH","kernel_version":"$EKERNEL","cpu_info":"$ECPU","cpu_cores":"$CPU_CORES","gpu_info":$GPU_INFO_VALUE,"processes":"$PROCESSES","tcp_conn":"$TCP_CONN","udp_conn":"$UDP_CONN","ip_v4":"$EIPV4","ip_v6":"$EIPV6","ping_ct":$PING_CT_JSON,"ping_cu":$PING_CU_JSON,"ping_cm":$PING_CM_JSON,"ping_bd":$PING_BD_JSON,"loss_ct":$LOSS_CT_JSON,"loss_cu":$LOSS_CU_JSON,"loss_cm":$LOSS_CM_JSON,"loss_bd":$LOSS_BD_JSON}
 EOF
 )
     SAMPLE_METRICS_JSON=$(cat <<EOF
@@ -1416,41 +1711,42 @@ EOF
     if [ "$LAST_REPORT_TIME" -eq 0 ] || [ $((LOOP_START_TIME - LAST_REPORT_TIME)) -ge "$REPORT_INTERVAL" ]; then
         if [ "$COLLECT_INTERVAL" -gt 0 ]; then
             PAYLOAD=$(cat <<EOF
-{"id":"$SERVER_ID","secret":"$SECRET","metrics":$METRICS_JSON,"samples":[$SAMPLES_JSON],"collect_interval":$COLLECT_INTERVAL,"report_interval":$REPORT_INTERVAL}
+{"id":"$ESERVER_ID","secret":"$ESECRET","metrics":$METRICS_JSON,"samples":[$SAMPLES_JSON],"collect_interval":$COLLECT_INTERVAL,"report_interval":$REPORT_INTERVAL}
 EOF
 )
         else
             PAYLOAD=$(cat <<EOF
-{"id":"$SERVER_ID","secret":"$SECRET","metrics":$METRICS_JSON,"collect_interval":$COLLECT_INTERVAL,"report_interval":$REPORT_INTERVAL}
+{"id":"$ESERVER_ID","secret":"$ESECRET","metrics":$METRICS_JSON,"collect_interval":$COLLECT_INTERVAL,"report_interval":$REPORT_INTERVAL}
 EOF
 )
         fi
         PAYLOAD_BYTES=$(printf "%s" "$PAYLOAD" | wc -c | awk '{print $1}')
         log_debug "Report attempt: url=${WORKER_URL} samples=${SAMPLE_COUNT} payload_bytes=${PAYLOAD_BYTES}"
 
-        REPORT_RESPONSE_FILE="/dev/shm/.cf_probe_response.$$"
-        REPORT_HEADER_FILE="/dev/shm/.cf_probe_headers.$$"
-        REPORT_ERROR_FILE="/dev/shm/.cf_probe_error.$$"
-        REPORT_HEADERS=""
-        REPORT_HTTP_CODE=$(curl -sS -D "$REPORT_HEADER_FILE" -o "$REPORT_RESPONSE_FILE" -w "%{http_code}" -X POST \
-            -H "Content-Type: application/json" \
-            -H "X-Agent-Config-Schema: 3" \
-            -H "X-Agent-Version: ${AGENT_VERSION}" \
-            -H "X-Agent-Config-Md5: ${CONFIG_MD5:-none}" \
-            -d "$PAYLOAD" -m 8 --connect-timeout 3 "$WORKER_URL" 2>"$REPORT_ERROR_FILE")
-        REPORT_CURL_EXIT=$?
-        case "$REPORT_HTTP_CODE" in ''|*[!0-9]*) REPORT_HTTP_CODE=000 ;; esac
-        REPORT_RESPONSE=$(head -c 300 "$REPORT_RESPONSE_FILE" 2>/dev/null | tr '\r\n' '  ')
-        REPORT_HEADERS=$(head -c 500 "$REPORT_HEADER_FILE" 2>/dev/null | tr '\r\n' '  ')
-        REPORT_ERROR=$(head -c 300 "$REPORT_ERROR_FILE" 2>/dev/null | tr '\r\n' '  ')
-        log_debug "Report response: http=${REPORT_HTTP_CODE} curl_exit=${REPORT_CURL_EXIT} headers=${REPORT_HEADERS} body=${REPORT_RESPONSE}"
-        if [ "$REPORT_CURL_EXIT" -ne 0 ] || [ "$REPORT_HTTP_CODE" -lt 200 ] || [ "$REPORT_HTTP_CODE" -ge 300 ]; then
-            log_warn_debug "Report failed: curl_exit=${REPORT_CURL_EXIT} http=${REPORT_HTTP_CODE} samples=${SAMPLE_COUNT} payload_bytes=${PAYLOAD_BYTES} response=${REPORT_RESPONSE} error=${REPORT_ERROR}"
-        else
-            if [ "$REPORT_HTTP_CODE" = "200" ] && ! apply_remote_config "$REPORT_RESPONSE_FILE" "$REPORT_HEADER_FILE"; then
-                log_warn_debug "Dynamic configuration rejected"
+        REPORT_RESPONSE_FILE=$(umask 077; mktemp "${RUN_DIR}/response.XXXXXX" 2>/dev/null) || REPORT_RESPONSE_FILE=""
+        REPORT_HEADER_FILE=$(umask 077; mktemp "${RUN_DIR}/headers.XXXXXX" 2>/dev/null) || REPORT_HEADER_FILE=""
+        REPORT_ERROR_FILE=$(umask 077; mktemp "${RUN_DIR}/error.XXXXXX" 2>/dev/null) || REPORT_ERROR_FILE=""
+        if [ -n "$REPORT_RESPONSE_FILE" ] && [ -n "$REPORT_HEADER_FILE" ] && [ -n "$REPORT_ERROR_FILE" ]; then
+            REPORT_HTTP_CODE=$(printf '%s' "$PAYLOAD" | curl -sS -D "$REPORT_HEADER_FILE" -o "$REPORT_RESPONSE_FILE" -w "%{http_code}" -X POST \
+                -H "Content-Type: application/json" \
+                -H "X-Agent-Config-Schema: 3" \
+                -H "X-Agent-Version: ${AGENT_VERSION}" \
+                -H "X-Agent-Config-Md5: ${CONFIG_MD5:-none}" \
+                --data-binary @- -m 8 --connect-timeout 3 -- "$WORKER_URL" 2>"$REPORT_ERROR_FILE")
+            REPORT_CURL_EXIT=$?
+            case "$REPORT_HTTP_CODE" in ''|*[!0-9]*) REPORT_HTTP_CODE=000 ;; esac
+            REPORT_RESPONSE=$(head -c 300 "$REPORT_RESPONSE_FILE" 2>/dev/null | tr '\r\n' '  ')
+            REPORT_HEADERS=$(head -c 500 "$REPORT_HEADER_FILE" 2>/dev/null | tr '\r\n' '  ')
+            REPORT_ERROR=$(head -c 300 "$REPORT_ERROR_FILE" 2>/dev/null | tr '\r\n' '  ')
+            log_debug "Report response: http=${REPORT_HTTP_CODE} curl_exit=${REPORT_CURL_EXIT} headers=${REPORT_HEADERS} body=${REPORT_RESPONSE}"
+            if [ "$REPORT_CURL_EXIT" -ne 0 ] || [ "$REPORT_HTTP_CODE" -lt 200 ] || [ "$REPORT_HTTP_CODE" -ge 300 ]; then
+                log_warn_debug "Report failed: curl_exit=${REPORT_CURL_EXIT} http=${REPORT_HTTP_CODE} samples=${SAMPLE_COUNT} payload_bytes=${PAYLOAD_BYTES} response=${REPORT_RESPONSE} error=${REPORT_ERROR}"
+            else
+                if [ "$REPORT_HTTP_CODE" = "200" ] && ! apply_remote_config "$REPORT_RESPONSE_FILE" "$REPORT_HEADER_FILE"; then
+                    log_warn_debug "Dynamic configuration rejected"
+                fi
+                log_debug "Report success: http=${REPORT_HTTP_CODE} samples=${SAMPLE_COUNT} payload_bytes=${PAYLOAD_BYTES} response=${REPORT_RESPONSE}"
             fi
-            log_debug "Report success: http=${REPORT_HTTP_CODE} samples=${SAMPLE_COUNT} payload_bytes=${PAYLOAD_BYTES} response=${REPORT_RESPONSE}"
         fi
         rm -f "$REPORT_RESPONSE_FILE" "$REPORT_HEADER_FILE" "$REPORT_ERROR_FILE" 2>/dev/null || true
         SAMPLES_JSON=""
@@ -1462,7 +1758,8 @@ EOF
 done
 PROBE_EOF
 
-    chmod +x "${SCRIPT_FILE}"
+    chmod 755 "${script_tmp}"
+    mv -f "${script_tmp}" "${SCRIPT_FILE}"
     info "探针脚本注入完成: ${SCRIPT_FILE}"
 }
 
@@ -1473,9 +1770,7 @@ create_service() {
 
     cat > "${RC_FILE}" << EOF
 #!/bin/sh
-# CF-Server-Monitor Synology RC Script
-# chkconfig: 2345 99 01
-# description: CF Server Monitor Probe Agent
+export LC_ALL=C LANG=C
 
 NAME="${SERVICE_NAME}"
 SCRIPT="${SCRIPT_FILE}"
@@ -1484,18 +1779,18 @@ LOG_FILE="${CONTAINER_LOG_FILE}"
 DEBUG_ENV="${DEBUG_ENV_FILE}"
 
 start() {
-    if [ -f "\${PID_FILE}" ] && kill -0 \$(cat "\${PID_FILE}") 2>/dev/null; then
-        echo "\${NAME} is already running (PID: \$(cat \${PID_FILE}))"
+    if [ -f "\${PID_FILE}" ] && kill -0 "\$(cat "\${PID_FILE}")" 2>/dev/null; then
+        echo "\${NAME} is already running (PID: \$(cat "\${PID_FILE}"))"
         return 0
     fi
     echo "Starting \${NAME}..."
     mkdir -p /var/log 2>/dev/null || true
-    local debug_val=0
+    debug_val=0
     if [ -f "\${DEBUG_ENV}" ]; then
         debug_val=\$(grep 'CF_PROBE_DEBUG=' "\${DEBUG_ENV}" 2>/dev/null | cut -d= -f2 || echo 0)
     fi
     nohup /bin/bash "\${SCRIPT}" -debug="\${debug_val}" >> "\${LOG_FILE}" 2>&1 &
-    local pid=\$!
+    pid=\$!
     echo "\${pid}" > "\${PID_FILE}"
     sleep 1.5
     if kill -0 "\${pid}" 2>/dev/null; then
@@ -1508,7 +1803,6 @@ start() {
 
 stop() {
     if [ -f "\${PID_FILE}" ]; then
-        local pid
         pid=\$(cat "\${PID_FILE}" 2>/dev/null || echo "")
         if [ -n "\${pid}" ] && kill -0 "\${pid}" 2>/dev/null; then
             echo "Stopping \${NAME} (PID: \${pid})..."
@@ -1523,8 +1817,8 @@ stop() {
 }
 
 status() {
-    if [ -f "\${PID_FILE}" ] && kill -0 \$(cat "\${PID_FILE}") 2>/dev/null; then
-        echo "\${NAME} is running (PID: \$(cat \${PID_FILE}))"
+    if [ -f "\${PID_FILE}" ] && kill -0 "\$(cat "\${PID_FILE}")" 2>/dev/null; then
+        echo "\${NAME} is running (PID: \$(cat "\${PID_FILE}"))"
     else
         echo "\${NAME} is not running"
     fi
@@ -1551,7 +1845,7 @@ EOF
 
 apply_debug_runtime_env() {
     if [ "${DEBUG_MODE:-0}" = "1" ]; then
-        if mkdir -p /var/run 2>/dev/null && printf 'CF_PROBE_DEBUG=1\n' > "${DEBUG_ENV_FILE}" 2>/dev/null; then
+        if mkdir -p /var/run 2>/dev/null && (umask 077; printf 'CF_PROBE_DEBUG=1\n' > "${DEBUG_ENV_FILE}") 2>/dev/null; then
             chmod 600 "${DEBUG_ENV_FILE}" 2>/dev/null || true
         else
             warn "调试日志运行参数写入失败，将按默认值 0 启动"
@@ -1570,7 +1864,6 @@ start_service() {
     fi
 
     mkdir -p /var/log 2>/dev/null || true
-    mkdir -p /dev/shm 2>/dev/null || true
 
     local debug_val=0
     if [ -f "${DEBUG_ENV_FILE}" ]; then
@@ -1591,7 +1884,8 @@ start_service() {
 
 install_probe() {
     SERVER_ID=""
-    SECRET=""
+    SECRET="${CF_PROBE_SECRET:-}"
+    unset CF_PROBE_SECRET || true
     WORKER_URL=""
     COLLECT_INTERVAL=""
     REPORT_INTERVAL=""
@@ -1621,8 +1915,14 @@ install_probe() {
             -interface=*|-interfaces=*|-iface=*) INTERFACE="${arg#*=}" ;;
             -reset_day=*) RESET_DAY="${arg#-reset_day=}" ;;
             -auto_update=*|-auto-update=*) AUTO_UPDATE=$(normalize_binary_value "${arg#*=}") || error "auto_update 参数非法，仅支持 0 或 1" ;;
-            -rx_correction=*) RX_CORRECTION="${arg#-rx_correction=}" ;;
-            -tx_correction=*) TX_CORRECTION="${arg#-tx_correction=}" ;;
+            -rx_correction=*)
+                RX_CORRECTION="${arg#-rx_correction=}"
+                is_valid_correction_value "$RX_CORRECTION" || error "rx_correction 参数非法，必须为 0 到 ${MAX_TRAFFIC_CORRECTION_GB} 之间的非负数字"
+                ;;
+            -tx_correction=*)
+                TX_CORRECTION="${arg#-tx_correction=}"
+                is_valid_correction_value "$TX_CORRECTION" || error "tx_correction 参数非法，必须为 0 到 ${MAX_TRAFFIC_CORRECTION_GB} 之间的非负数字"
+                ;;
             -debug=*) DEBUG_MODE=$(normalize_binary_value "${arg#-debug=}") || error "debug 参数非法，仅支持 0 或 1" ;;
         esac
     done
@@ -1636,8 +1936,10 @@ install_probe() {
 
     if [ -f "${CONFIG_FILE}" ]; then
         step "检测到已有配置文件，执行二次安装..."
+        ensure_secure_config_dir
 
         if [ -n "${SERVER_ID}" ] && [ -n "${SECRET}" ] && [ -n "${WORKER_URL}" ]; then
+            validate_worker_url "${WORKER_URL}" || error "url 参数非法，必须以 https:// 或 http:// 开头且不含空白或引号"
             COLLECT_INTERVAL=${COLLECT_INTERVAL:-0}
             REPORT_INTERVAL=${REPORT_INTERVAL:-60}
             [ -z "$RESET_DAY" ] && RESET_DAY=1
@@ -1646,7 +1948,7 @@ install_probe() {
 
             step "更新配置文件..."
             INTERFACE=$(normalize_interface_list "${INTERFACE:-}") || error "interface parameter is invalid; use comma-separated interface names"
-            cat > "${CONFIG_FILE}" << EOF
+            atomic_write_file "${CONFIG_FILE}" << EOF
 SERVER_ID="${SERVER_ID}"
 SECRET="${SECRET}"
 WORKER_URL="${WORKER_URL}"
@@ -1661,10 +1963,10 @@ RESET_DAY="${RESET_DAY}"
 AUTO_UPDATE="${AUTO_UPDATE}"
 CONFIG_MD5="none"
 EOF
-            chmod 600 "${CONFIG_FILE}" 2>/dev/null || true
             info "配置文件已更新: ${CONFIG_FILE}"
         else
             step "从配置文件读取参数..."
+            chmod 600 "${CONFIG_FILE}" 2>/dev/null || true
             while IFS='=' read -r key value; do
                 case "$key" in
                     SERVER_ID) SERVER_ID="${value%\"}"; SERVER_ID="${SERVER_ID#\"}" ;;
@@ -1682,11 +1984,13 @@ EOF
                     CONFIG_MD5) CONFIG_MD5="${value%\"}"; CONFIG_MD5="${CONFIG_MD5#\"}" ;;
                 esac
             done < "${CONFIG_FILE}"
+            validate_worker_url "${WORKER_URL}" || error "配置文件中的 WORKER_URL 非法"
         fi
     else
         if [ -z "${SERVER_ID}" ] || [ -z "${SECRET}" ] || [ -z "${WORKER_URL}" ]; then
             print_usage
         fi
+        validate_worker_url "${WORKER_URL}" || error "url 参数非法，必须以 https:// 或 http:// 开头且不含空白或引号"
 
         COLLECT_INTERVAL=${COLLECT_INTERVAL:-0}
         REPORT_INTERVAL=${REPORT_INTERVAL:-60}
@@ -1694,22 +1998,23 @@ EOF
         AUTO_UPDATE=$(normalize_binary_value "$AUTO_UPDATE" 0) || error "auto_update 参数非法，仅支持 0 或 1"
         DEBUG_MODE=$(normalize_binary_value "$DEBUG_MODE" 0) || error "debug 参数非法，仅支持 0 或 1"
 
-        step "创建配置目录..."
-        mkdir -p "${CONFIG_DIR}" 2>/dev/null || true
+        step "创建受保护配置目录..."
+        ensure_secure_config_dir
 
         if [ -f "${OLD_TRAFFIC_DATA_FILE}" ]; then
             step "迁移旧流量数据..."
             mv "${OLD_TRAFFIC_DATA_FILE}" "${TRAFFIC_DATA_FILE}" 2>/dev/null || true
+            chmod 600 "${TRAFFIC_DATA_FILE}" 2>/dev/null || true
             rm -rf /var/lib/cf-probe 2>/dev/null || true
             info "已从旧路径迁移流量数据"
         elif [ ! -f "${TRAFFIC_DATA_FILE}" ]; then
-            touch "${TRAFFIC_DATA_FILE}" 2>/dev/null || true
+            (umask 077; : > "${TRAFFIC_DATA_FILE}") 2>/dev/null || true
             info "创建新流量数据文件"
         fi
 
         step "生成配置文件..."
         INTERFACE=$(normalize_interface_list "${INTERFACE:-}") || error "interface parameter is invalid; use comma-separated interface names"
-        cat > "${CONFIG_FILE}" << EOF
+        atomic_write_file "${CONFIG_FILE}" << EOF
 SERVER_ID="${SERVER_ID}"
 SECRET="${SECRET}"
 WORKER_URL="${WORKER_URL}"
@@ -1724,7 +2029,6 @@ RESET_DAY="${RESET_DAY}"
 AUTO_UPDATE="${AUTO_UPDATE}"
 CONFIG_MD5="none"
 EOF
-        chmod 600 "${CONFIG_FILE}" 2>/dev/null || true
         info "配置文件已生成: ${CONFIG_FILE}"
     fi
 
@@ -1733,25 +2037,23 @@ EOF
     AUTO_UPDATE=$(normalize_binary_value "$AUTO_UPDATE" 0) || error "auto_update 参数非法，仅支持 0 或 1"
     DEBUG_MODE=$(normalize_binary_value "$DEBUG_MODE" 0) || error "debug 参数非法，仅支持 0 或 1"
     CONFIG_MD5=${CONFIG_MD5:-none}
-
     INTERFACE=$(normalize_interface_list "${INTERFACE:-}") || error "interface parameter is invalid; use comma-separated interface names"
 
     if [ -n "${RX_CORRECTION}" ] || [ -n "${TX_CORRECTION}" ]; then
         step "应用流量校正..."
         rm -f "${OLD_TRAFFIC_DATA_FILE}" 2>/dev/null || true
-
-        mkdir -p "${CONFIG_DIR}" 2>/dev/null || true
-        local now_ts=$(date '+%s')
-        local rx_correction_bytes=0 tx_correction_bytes=0
-        local current_net=$(get_configured_net_bytes "${INTERFACE:-}")
-        local current_rx=$(echo "${current_net}" | awk '{print $1}'); current_rx=${current_rx:-0}
-        local current_tx=$(echo "${current_net}" | awk '{print $2}'); current_tx=${current_tx:-0}
+        ensure_secure_config_dir
+        local now_ts rx_correction_bytes=0 tx_correction_bytes=0 current_net current_rx current_tx
+        now_ts=$(date '+%s')
+        current_net=$(get_configured_net_bytes "${INTERFACE:-}")
+        current_rx=$(echo "${current_net}" | awk '{print $1}'); current_rx=${current_rx:-0}
+        current_tx=$(echo "${current_net}" | awk '{print $2}'); current_tx=${current_tx:-0}
         [ -n "${RX_CORRECTION}" ] && rx_correction_bytes=$(echo "${RX_CORRECTION}" | awk '{printf "%.0f", $1 * 1024 * 1024 * 1024}')
         [ -n "${TX_CORRECTION}" ] && tx_correction_bytes=$(echo "${TX_CORRECTION}" | awk '{printf "%.0f", $1 * 1024 * 1024 * 1024}')
         [ -n "${RX_CORRECTION}" ] && info "下行流量校正: ${RX_CORRECTION}GB"
         [ -n "${TX_CORRECTION}" ] && info "上行流量校正: ${TX_CORRECTION}GB"
 
-        cat > "${TRAFFIC_DATA_FILE}" << EOF
+        atomic_write_file "${TRAFFIC_DATA_FILE}" << EOF
 RX_PREV=${current_rx}
 TX_PREV=${current_tx}
 RX_PERIOD=${rx_correction_bytes}
@@ -1804,6 +2106,11 @@ uninstall_probe() {
     echo -e "${YELLOW}[!] 开始执行无残留深度卸载清理方案...${NC}\n"
     check_root
 
+    step "取消延迟自动更新任务..."
+    kill_matching_processes ".auto_update."
+    kill_matching_processes "cf-probe-auto-update"
+    kill_matching_processes "auto_update_install"
+
     step "停用并清理 RC 启动脚本..."
     if [ -f "${RC_FILE}" ]; then
         "${RC_FILE}" stop 2>/dev/null || true
@@ -1815,8 +2122,9 @@ uninstall_probe() {
     step "销毁探针物理可执行代码文件..."
     rm -f "${SCRIPT_FILE}"
 
-    step "抹除共享内存高速缓存区..."
-    rm -f /dev/shm/.cf_ipv4 /dev/shm/.cf_ipv6 /dev/shm/.cf_probe_*
+    step "抹除运行目录与缓存区..."
+    rm -rf /run/cf-probe /var/run/cf-probe 2>/dev/null || true
+    rm -f /dev/shm/.cf_ipv4 /dev/shm/.cf_ipv6 /dev/shm/.cf_probe_* 2>/dev/null || true
 
     step "抹除流量追踪数据..."
     rm -rf /var/lib/${SERVICE_NAME}
@@ -1826,18 +2134,16 @@ uninstall_probe() {
     if [ -f "${CONTAINER_PID_FILE}" ]; then
         local old_pid
         old_pid=$(cat "${CONTAINER_PID_FILE}" 2>/dev/null || echo "")
-        if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
-            kill "$old_pid" 2>/dev/null || true
-        fi
+        case "$old_pid" in
+            ''|*[!0-9]*) ;;
+            *) kill "$old_pid" 2>/dev/null || true ;;
+        esac
         rm -f "${CONTAINER_PID_FILE}"
     fi
-    rm -f "${CONTAINER_LOG_FILE}"
-    rm -f "${DEBUG_ENV_FILE}"
+    rm -f "${CONTAINER_LOG_FILE}" "${DEBUG_ENV_FILE}"
 
     step "根除孤儿或僵尸状态的探测残留进程..."
-    if pgrep -f "${SERVICE_NAME}.sh" >/dev/null 2>&1; then
-        pkill -9 -f "${SERVICE_NAME}.sh" 2>/dev/null || true
-    fi
+    kill_matching_processes "${SCRIPT_FILE}"
 
     echo -e "\n${GREEN}╔══════════════════════════════════════════╗"
     echo -e "║     ✓ 卸载完毕！系统环境无任何残留。     ║"

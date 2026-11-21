@@ -1,3 +1,17 @@
+/*
+  X-Content-Type-Options: nosniff
+  X-Frame-Options: DENY
+  Referrer-Policy: strict-origin-when-cross-origin
+
+/install*.sh
+  Cache-Control: no-cache, no-store, must-revalidate
+
+/cf-server-monitor.ps1
+  Cache-Control: no-cache, no-store, must-revalidate
+
+/uninstall*
+  Cache-Control: no-cache, no-store, must-revalidate
+
 /assets/*
   Cache-Control: public, max-age=31536000, immutable
 

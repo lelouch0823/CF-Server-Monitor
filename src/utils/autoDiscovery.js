@@ -1,4 +1,4 @@
-import { getNextServerHistoryPartitionId } from '../database/indexOptimization.js';
+import { getNextServerHistoryPartitionId, isHistoryPartitionUniqueError } from '../database/indexOptimization.js';
 import { clearServersListCache } from './cache.js';
 import { normalizeBooleanSetting } from './settings.js';
 
@@ -59,14 +59,26 @@ async function findServerIdByName(db, name) {
 async function createServerRow(db, name) {
   const id = crypto.randomUUID();
   const row = await db.prepare('SELECT COALESCE(MAX(sort_order), -1) as max_order FROM servers').first();
-  const sortOrder = (Number(row?.max_order) || 0) + 1;
-  const historyPartitionId = await getNextServerHistoryPartitionId(db);
+  const maxOrder = row?.max_order;
+  const sortOrder = (Number.isFinite(Number(maxOrder)) ? Math.trunc(Number(maxOrder)) : -1) + 1;
 
-  await db.prepare(`
-    INSERT INTO servers
-    (id, name, server_group, region, "interface", sort_order, history_partition_id, timestamp)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).bind(id, name, 'Default', '', '', sortOrder, historyPartitionId, Date.now()).run();
+  const MAX_PARTITION_RETRIES = 3;
+  for (let attempt = 0; attempt < MAX_PARTITION_RETRIES; attempt++) {
+    const historyPartitionId = await getNextServerHistoryPartitionId(db);
+    try {
+      await db.prepare(`
+        INSERT INTO servers
+        (id, name, server_group, region, "interface", sort_order, history_partition_id, timestamp)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).bind(id, name, 'Default', '', '', sortOrder, historyPartitionId, Date.now()).run();
+      return id;
+    } catch (e) {
+      if (isHistoryPartitionUniqueError(e) && attempt < MAX_PARTITION_RETRIES - 1) {
+        continue;
+      }
+      throw e;
+    }
+  }
 
   return id;
 }

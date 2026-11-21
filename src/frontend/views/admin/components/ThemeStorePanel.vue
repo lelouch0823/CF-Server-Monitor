@@ -92,7 +92,7 @@
                 class="btn btn-sm"
                 :class="{ 'btn-primary': applyingThemeId !== '__mikus_disable__' && isMikusThemeActive }"
                 :disabled="applyingThemeId === '__mikus_disable__' || !isMikusThemeActive"
-              >✕ {{ applyingThemeId === '__mikus_disable__' ? trans.saving : trans.close }}</button>
+              >✕ {{ applyingThemeId === '__mikus_disable__' ? trans.saving : trans.disable }}</button>
               <a href="https://github.com/mikus-loli/komari-mikus" target="_blank" rel="noopener noreferrer" class="btn btn-sm">↗ {{ trans.view }}</a>
             </div>
           </div>
@@ -574,7 +574,7 @@ const previewThemeUrl = async (themeUrl, previewingId) => {
       return
     }
 
-    const previewUrl = result.data?.preview_url
+    const previewUrl = getSafeExternalUrl(result.data?.preview_url)
     if (!previewUrl) {
       showThemeMessage(props.trans.themeApplyFailed)
       return

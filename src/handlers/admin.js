@@ -1,23 +1,93 @@
-import { buildAuthCookie, buildClearAuthCookie, checkAuth, simpleAuthResponse, validateCredentials, generateToken } from '../middleware/auth.js';
+import * as authMiddleware from '../middleware/auth.js';
 import { getLatestMetricsForAllServers } from '../database/schema.js';
 import { getAllServers, clearServersListCache } from '../utils/cache.js';
-import { clearAppearanceSettingsCache, isValidThemeOptions, isWssReportConfigured, isWssReportEnabled, normalizeBooleanSetting, normalizeDefaultLanguage, normalizeDisplayMode, normalizeExpireNotificationTime, normalizeExpireReminder, normalizeFrontendWsTimeoutMinutes, normalizeLongHistoryPoints, normalizeNotificationLanguage, normalizeNotificationTemplate, normalizeNotificationTimezone, normalizeNotificationWebhookBody, normalizeNotificationWebhookFormat, normalizeNotificationWebhookHeaders, normalizeNotificationWebhookMethod, normalizePreferredTheme, normalizeResourceAlertRules, normalizeTgNotify, normalizeWssReportHours, saveSiteOptions, saveThemeOptions, validateUserAgent, SITE_FIELDS, APPEARANCE_FIELDS } from '../utils/settings.js';
-import { mergeMetricsIntoServer } from '../utils/metrics.js';
+import {
+  clearAppearanceSettingsCache,
+  generateRandomSecret,
+  isValidThemeOptions,
+  isWssReportConfigured,
+  isWssReportEnabled,
+  normalizeBooleanSetting,
+  normalizeDefaultLanguage,
+  normalizeDisplayMode,
+  normalizeExpireNotificationTime,
+  normalizeExpireReminder,
+  normalizeFrontendWsTimeoutMinutes,
+  normalizeLongHistoryPoints,
+  normalizeNotificationLanguage,
+  normalizeNotificationTemplate,
+  normalizeNotificationTimezone,
+  normalizeNotificationWebhookBody,
+  normalizeNotificationWebhookFormat,
+  normalizeNotificationWebhookHeaders,
+  normalizeNotificationWebhookMethod,
+  normalizePreferredTheme,
+  normalizeResourceAlertRules,
+  normalizeTgNotify,
+  normalizeTrafficAlertThreshold,
+  normalizeWssReportHours,
+  saveSiteOptions,
+  saveThemeOptions,
+  validateTextSetting,
+  validateUserAgent,
+  TEXT_SETTING_MAX_LENGTHS,
+  SITE_FIELDS,
+  APPEARANCE_FIELDS
+} from '../utils/settings.js';
+import { mergeMetricsIntoServer, toSafeMetricFloat } from '../utils/metrics.js';
 import { normalizePctOrNull } from '../utils/traffic.js';
 import { verifyTurnstileToken, hashPassword } from '../utils/common.js';
 import { AppError, createSuccessResponse, createBadRequestResponse, createUnauthorizedResponse, createErrorResponse } from '../utils/errors.js';
 import { addServerColumns } from '../database/updateDatabase.js';
 import { clearResourceAlertState, isSmtpNotificationTarget, sendNotification } from '../services/notification.js';
 import { getNotificationMessages } from '../services/notificationMessages.js';
-import { getNextServerHistoryPartitionId, HISTORY_MAX_PARTITION_ID } from '../database/indexOptimization.js';
+import {
+  getHistoryIdRange,
+  getNextServerHistoryPartitionId,
+  HISTORY_MAX_PARTITION_ID,
+  isHistoryPartitionUniqueError,
+  normalizeHistoryPartitionId
+} from '../database/indexOptimization.js';
 import { isValidTrafficCorrection, normalizeConnectionMode, normalizePingMode, normalizeWssReportInterval, validateAgentConfigInput, validatePingNode, validateNetworkInterfaces } from '../utils/agentConfig.js';
-import { scheduleAgentConfigChanged, scheduleAgentReportModeChanged } from '../utils/agentConfigNotify.js';
-import { detectBillingCycle, detectCurrencySymbol, normalizeBillingCycle, normalizeCurrency, normalizePrice, renewExpireDateIfNeeded } from '../utils/serverBilling.js';
+import { scheduleAgentConfigChanged, scheduleAgentReportModeChanged, scheduleBroadcasterInvalidate } from '../utils/agentConfigNotify.js';
+import { clearLatestReportCache } from '../utils/latestReportCache.js';
+import { detectBillingCycle, detectCurrencySymbol, normalizeBillingCycle, normalizeCurrency, normalizePrice, parseDateOnly, renewExpireDateIfNeeded } from '../utils/serverBilling.js';
 import { THEME_PREVIEW_AUTH_TTL_SECONDS } from '../utils/config.js';
+import { readBoundedJsonObject } from './update.js';
+
+const {
+  AUTH_COOKIE_NAME,
+  buildAuthCookie,
+  buildClearAuthCookie,
+  checkAuth,
+  simpleAuthResponse,
+  validateCredentials,
+  generateToken
+} = authMiddleware;
 
 const PING_NODE_FIELDS = ['custom_ct', 'custom_cu', 'custom_cm', 'custom_bd', 'node_1', 'node_2', 'node_3', 'node_4'];
 const THEME_PREVIEW_AUTH_COOKIE = 'cfsm_theme_preview_auth';
 const DURABLE_OBJECTS_WEBSOCKET_MESSAGE_BILLING_RATIO = 20;
+const ADMIN_MAX_REQUEST_BYTES = 2 * 1024 * 1024;
+const ADMIN_MAX_BATCH_ITEMS = 1000;
+const D1_MUTATION_BATCH_SIZE = 50;
+const VALID_TRAFFIC_CALC_TYPES = new Set(['total', 'ul', 'dl', 'max']);
+const IMPORT_MIN_TIMESTAMP_MS = Date.UTC(2020, 0, 1);
+const IMPORT_MAX_FUTURE_DRIFT_MS = 60 * 1000;
+
+const IMPORT_SERVER_COLUMNS = Object.freeze([
+  'id', 'name', 'server_group', 'region', 'tags', 'note',
+  'price', 'billing_cycle', 'auto_renewal', 'currency', 'expire_date',
+  'traffic_limit', 'traffic_calc_type', '"interface"',
+  'reset_day', 'collect_interval', 'report_interval', 'wss_report_interval',
+  'connection_mode', 'ping_mode', 'auto_update',
+  'custom_ct', 'custom_cu', 'custom_cm', 'custom_bd',
+  'node_1', 'node_2', 'node_3', 'node_4',
+  'rx_correction', 'tx_correction',
+  'offline_notify_disabled', 'is_hidden',
+  'sort_order', 'history_partition_id', 'timestamp', 'traffic_alert_percent'
+]);
+const IMPORT_SERVER_PLACEHOLDERS = IMPORT_SERVER_COLUMNS.map(() => '?').join(', ');
 
 function toUsageNumber(value) {
   const number = Number(value);
@@ -138,9 +208,52 @@ function hasAppearanceInput(settings) {
 }
 
 function extractBearerToken(request) {
-  const authHeader = request.headers.get('Authorization') || '';
+  const authHeader = request?.headers?.get?.('Authorization') || '';
   const parts = authHeader.trim().split(/\s+/);
   return parts[0] === 'Bearer' && parts[1] ? parts[1] : '';
+}
+
+function getCookieValue(request, name) {
+  const cookie = request?.headers?.get?.('Cookie') || '';
+  const prefix = `${name}=`;
+  for (const part of cookie.split(';')) {
+    const item = part.trim();
+    if (!item.startsWith(prefix)) continue;
+    try {
+      return decodeURIComponent(item.slice(prefix.length));
+    } catch (_) {
+      return item.slice(prefix.length);
+    }
+  }
+  return '';
+}
+
+async function resolveVerifiedPreviewToken(request, env, sys) {
+  if (typeof authMiddleware.getVerifiedAuthToken === 'function') {
+    return (await authMiddleware.getVerifiedAuthToken(request, env, sys)) || '';
+  }
+
+  const bearerToken = extractBearerToken(request);
+  if (bearerToken) {
+    const bearerOnlyRequest = new Request(request.url, {
+      headers: { Authorization: `Bearer ${bearerToken}` }
+    });
+    if (await checkAuth(bearerOnlyRequest, env, sys)) {
+      return bearerToken;
+    }
+  }
+
+  const cookieHeader = request?.headers?.get?.('Cookie') || '';
+  if (cookieHeader) {
+    const cookieOnlyRequest = new Request(request.url, {
+      headers: { Cookie: cookieHeader }
+    });
+    if (await checkAuth(cookieOnlyRequest, env, sys)) {
+      return getCookieValue(request, AUTH_COOKIE_NAME || 'cfsm_auth');
+    }
+  }
+
+  return '';
 }
 
 function buildThemePreviewUrl(request, themeUrl) {
@@ -229,24 +342,98 @@ async function validateThemeUrlAvailable(themeUrl) {
   }
 }
 
-async function deleteServer(db, id) {
-  try {
-    const stmt1 = db.prepare(`PRAGMA foreign_key_list(metrics_history)`);
-    const result1 = await stmt1.all();
-    if (result1.results.length > 0) {
-      await db.prepare('DELETE FROM metrics_history WHERE server_id = ?').bind(id).run();
+async function executeBatchedStatements(db, statements, chunkSize = D1_MUTATION_BATCH_SIZE) {
+  for (let offset = 0; offset < statements.length; offset += chunkSize) {
+    const chunk = statements.slice(offset, offset + chunkSize);
+    if (typeof db.batch === 'function') {
+      await db.batch(chunk);
+    } else {
+      for (const stmt of chunk) {
+        await stmt.run();
+      }
     }
-
-    const stmt2 = db.prepare(`PRAGMA foreign_key_list(metrics_history_old)`);
-    const result2 = await stmt2.all();
-    if (result2.results.length > 0) {
-      await db.prepare('DELETE FROM metrics_history_old WHERE server_id = ?').bind(id).run();
-    }
-
-    await db.prepare('DELETE FROM servers WHERE id = ?').bind(id).run();
-  } catch (err) {
-    throw err;
   }
+}
+
+async function deleteServersAndHistory(db, ids) {
+  const uniqueIds = Array.from(new Set(
+    (Array.isArray(ids) ? ids : [])
+      .map(id => String(id || '').trim())
+      .filter(Boolean)
+  ));
+  if (uniqueIds.length === 0) return;
+
+  const partitionIds = new Set();
+  for (let offset = 0; offset < uniqueIds.length; offset += D1_MUTATION_BATCH_SIZE) {
+    const chunkIds = uniqueIds.slice(offset, offset + D1_MUTATION_BATCH_SIZE);
+    const placeholders = chunkIds.map(() => '?').join(', ');
+    const queryResult = await db.prepare(
+      `SELECT id, history_partition_id FROM servers WHERE id IN (${placeholders})`
+    ).bind(...chunkIds).all();
+    for (const row of queryResult?.results || []) {
+      const partitionId = normalizeHistoryPartitionId(row?.history_partition_id);
+      if (partitionId) {
+        partitionIds.add(partitionId);
+      }
+    }
+  }
+
+  let oldTableExists = false;
+  if (partitionIds.size > 0) {
+    try {
+      const oldTableRow = await db.prepare(
+        `SELECT name FROM sqlite_master WHERE type='table' AND name='metrics_history_old'`
+      ).first();
+      oldTableExists = Boolean(oldTableRow);
+    } catch (_) {
+      oldTableExists = false;
+    }
+  }
+
+  const historyDeleteStatements = [];
+  for (const partitionId of partitionIds) {
+    const { startId, endId } = getHistoryIdRange(partitionId);
+    historyDeleteStatements.push(
+      db.prepare('DELETE FROM metrics_history WHERE id >= ? AND id <= ?').bind(startId, endId)
+    );
+    if (oldTableExists) {
+      historyDeleteStatements.push(
+        db.prepare('DELETE FROM metrics_history_old WHERE id >= ? AND id <= ?').bind(startId, endId)
+      );
+    }
+  }
+
+  const serverDeleteStatements = uniqueIds.map(id =>
+    db.prepare('DELETE FROM servers WHERE id = ?').bind(id)
+  );
+
+  try {
+    await executeBatchedStatements(
+      db,
+      [...historyDeleteStatements, ...serverDeleteStatements],
+      D1_MUTATION_BATCH_SIZE
+    );
+  } catch (e) {
+    const msg = e?.message || String(e || '');
+    if (!/no such table:\s*metrics_history/i.test(msg)) {
+      throw e;
+    }
+    // 全新未初始化 metrics_history 表时，容错跳过不存在的历史表并继续删除 servers 行
+    for (const stmt of historyDeleteStatements) {
+      try {
+        await stmt.run();
+      } catch (histErr) {
+        if (!/no such table:\s*metrics_history/i.test(histErr?.message || String(histErr || ''))) {
+          throw histErr;
+        }
+      }
+    }
+    await executeBatchedStatements(db, serverDeleteStatements, D1_MUTATION_BATCH_SIZE);
+  }
+}
+
+async function deleteServer(db, id) {
+  await deleteServersAndHistory(db, [id]);
 }
 
 function getUtcTodayRange() {
@@ -462,17 +649,100 @@ async function getD1DailyUsage(token, accountId) {
   };
 }
 
+// 登录失败节流：按客户端 IP 维护带容量上限（LRU）的内存滑动窗口计数，
+// 防止攻击者故意触发全局锁定封死真实管理员，同时抑制 PBKDF2 算力放大。
+const LOGIN_FAILURE_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_FAILURE_LOCK_THRESHOLD = 5;
+const LOGIN_FAILURE_LOCK_MS = 15 * 60 * 1000;
+const LOGIN_FAILURE_MAX_IPS = 1000;
+const LOGIN_USERNAME_MAX_LENGTH = 128;
+const LOGIN_PASSWORD_MAX_LENGTH = 256;
+const loginFailureMap = new Map();
+
+export function resetLoginFailureStateForTests() {
+  loginFailureMap.clear();
+}
+
+function getClientIpKey(request) {
+  const raw = String(request?.headers?.get?.('CF-Connecting-IP') || '').trim();
+  return raw ? raw.slice(0, 128) : 'local';
+}
+
+function pruneLoginFailureMap(now) {
+  for (const [ip, state] of loginFailureMap) {
+    if (!state) {
+      loginFailureMap.delete(ip);
+      continue;
+    }
+    if (state.lockedUntil > 0 && state.lockedUntil <= now) {
+      loginFailureMap.delete(ip);
+      continue;
+    }
+    if (!state.lockedUntil && state.firstFailureTs > 0 && now - state.firstFailureTs > LOGIN_FAILURE_WINDOW_MS) {
+      loginFailureMap.delete(ip);
+    }
+  }
+
+  while (loginFailureMap.size > LOGIN_FAILURE_MAX_IPS) {
+    const oldestKey = loginFailureMap.keys().next().value;
+    if (oldestKey === undefined) break;
+    loginFailureMap.delete(oldestKey);
+  }
+}
+
+function isLoginLocked(clientIp, now) {
+  const state = loginFailureMap.get(clientIp);
+  if (!state) return false;
+  if (state.lockedUntil > now) {
+    // Refresh LRU order on active lock hit
+    loginFailureMap.delete(clientIp);
+    loginFailureMap.set(clientIp, state);
+    return true;
+  }
+  if (state.lockedUntil && state.lockedUntil <= now) {
+    loginFailureMap.delete(clientIp);
+  }
+  return false;
+}
+
+function recordLoginFailure(clientIp, now) {
+  pruneLoginFailureMap(now);
+  const existing = loginFailureMap.get(clientIp);
+  let nextState;
+  if (!existing || !existing.firstFailureTs || now - existing.firstFailureTs > LOGIN_FAILURE_WINDOW_MS) {
+    nextState = { count: 1, firstFailureTs: now, lockedUntil: 0 };
+  } else {
+    const nextCount = existing.count + 1;
+    if (nextCount >= LOGIN_FAILURE_LOCK_THRESHOLD) {
+      nextState = { count: 0, firstFailureTs: 0, lockedUntil: now + LOGIN_FAILURE_LOCK_MS };
+    } else {
+      nextState = { count: nextCount, firstFailureTs: existing.firstFailureTs, lockedUntil: 0 };
+    }
+  }
+  loginFailureMap.delete(clientIp);
+  loginFailureMap.set(clientIp, nextState);
+  pruneLoginFailureMap(now);
+}
+
+function recordLoginSuccess(clientIp) {
+  loginFailureMap.delete(clientIp);
+}
+
 async function handleLoginAction({ request, env, sys, data }) {
   const { username, password } = data;
 
-  if (!username || !password) {
+  if (typeof username !== 'string' || typeof password !== 'string' || !username || !password) {
     return createBadRequestResponse('missingCredentials');
   }
+  if (username.length > LOGIN_USERNAME_MAX_LENGTH || password.length > LOGIN_PASSWORD_MAX_LENGTH) {
+    return createBadRequestResponse('invalidCredentials');
+  }
 
-  const turnstileEnabled = sys && (sys.turnstile_enabled === 'true' || sys.turnstile_enabled === true);
-  const turnstileLoginEnabled = sys && (sys.turnstile_login_enabled === 'true' || sys.turnstile_login_enabled === true);
+  const turnstileEnabled = normalizeBooleanSetting(sys?.turnstile_enabled) === 'true';
+  const turnstileLoginEnabled = normalizeBooleanSetting(sys?.turnstile_login_enabled) === 'true';
   const turnstileSecretKey = sys && sys.turnstile_secret_key || '';
 
+  // 启用登录 Turnstile 时，先验证 Turnstile 再检查/累计登录失败次数
   if (turnstileEnabled || turnstileLoginEnabled) {
     const turnstileToken = request.headers.get('X-Turnstile-Token');
     const isTurnstileVerified = await verifyTurnstileToken(turnstileToken, turnstileSecretKey);
@@ -482,11 +752,19 @@ async function handleLoginAction({ request, env, sys, data }) {
     }
   }
 
+  const now = Date.now();
+  const clientIp = getClientIpKey(request);
+  if (isLoginLocked(clientIp, now)) {
+    return createErrorResponse(new AppError('tooManyAttempts', 429));
+  }
+
   const credentialResult = await validateCredentials(username, password, env, sys);
 
   if (!credentialResult.valid) {
+    recordLoginFailure(clientIp, now);
     return createUnauthorizedResponse('invalidCredentials');
   }
+  recordLoginSuccess(clientIp);
 
   if (credentialResult.needsPasswordUpgrade) {
     try {
@@ -554,7 +832,7 @@ async function handleGetSettingsAction({ env, sys, loadFullSettings }) {
   });
 }
 
-async function handleStartThemePreviewAction({ request, data }) {
+async function handleStartThemePreviewAction({ request, env, sys, data }) {
   const normalizedThemeUrl = normalizeThemeUrl(data.theme_url);
   if (!normalizedThemeUrl) {
     return createBadRequestResponse('invalidThemeUrl');
@@ -563,7 +841,7 @@ async function handleStartThemePreviewAction({ request, data }) {
     return createBadRequestResponse('invalidThemeUrl');
   }
 
-  const token = extractBearerToken(request);
+  const token = await resolveVerifiedPreviewToken(request, env, sys);
   if (!token) {
     return simpleAuthResponse();
   }
@@ -642,9 +920,9 @@ async function handleListAction({ env, data }) {
 
     if (isOnline) {
       stats.online++;
-      stats.total_cpu += parseFloat(item.cpu) || 0;
-      stats.total_net_in += parseFloat(item.net_in_speed) || 0;
-      stats.total_net_out += parseFloat(item.net_out_speed) || 0;
+      stats.total_cpu += toSafeMetricFloat(item.cpu, { min: 0, max: 100 });
+      stats.total_net_in += toSafeMetricFloat(item.net_in_speed);
+      stats.total_net_out += toSafeMetricFloat(item.net_out_speed);
     } else {
       stats.offline++;
     }
@@ -749,11 +1027,42 @@ const AUTHENTICATED_ADMIN_ACTION_HANDLERS = {
   send_test_notification: handleSendTestNotificationAction
 };
 
-export async function handleAdminAPI(request, env, sys, loadFullSettings = null, ctx = null) {
-  try {
-    const data = await request.json();
+const BOOLEAN_SITE_SETTING_FIELDS = new Set([
+  'auto_discovery',
+  'is_public',
+  'show_price',
+  'show_expire',
+  'show_tf',
+  'show_three_net_details',
+  'wss_report_enabled',
+  'notification_webhook_enabled',
+  'turnstile_enabled',
+  'turnstile_login_enabled',
+  'servers_optimized'
+]);
 
-    const publicActionHandler = PUBLIC_ADMIN_ACTION_HANDLERS[data.action];
+export async function handleAdminAPI(request, env, sys, loadFullSettings = null, ctx = null) {
+  const bodyResult = await readBoundedJsonObject(request, ADMIN_MAX_REQUEST_BYTES);
+  if (!bodyResult.ok) {
+    if (bodyResult.status === 413) {
+      console.warn('Admin API payload too large:', {
+        declaredLength: bodyResult.declaredLength ?? null,
+        byteLength: bodyResult.byteLength ?? null,
+        limit: ADMIN_MAX_REQUEST_BYTES
+      });
+      return createErrorResponse(new AppError('payloadTooLarge', 413));
+    }
+    console.warn('Admin API invalid JSON body:', bodyResult.reason);
+    return createBadRequestResponse('invalidJson');
+  }
+
+  const data = bodyResult.data;
+
+  try {
+    const action = typeof data.action === 'string' ? data.action : '';
+    const publicActionHandler = action && Object.hasOwn(PUBLIC_ADMIN_ACTION_HANDLERS, action)
+      ? PUBLIC_ADMIN_ACTION_HANDLERS[action]
+      : null;
     if (publicActionHandler) {
       return publicActionHandler({ request, env, sys, data, loadFullSettings, ctx });
     }
@@ -762,16 +1071,30 @@ export async function handleAdminAPI(request, env, sys, loadFullSettings = null,
       return simpleAuthResponse();
     }
 
-    const authenticatedActionHandler = AUTHENTICATED_ADMIN_ACTION_HANDLERS[data.action];
+    const authenticatedActionHandler = action && Object.hasOwn(AUTHENTICATED_ADMIN_ACTION_HANDLERS, action)
+      ? AUTHENTICATED_ADMIN_ACTION_HANDLERS[action]
+      : null;
     if (authenticatedActionHandler) {
       return authenticatedActionHandler({ request, env, sys, data, loadFullSettings, ctx });
     }
 
-    if (data.action === 'save_settings') {
+    if (action === 'save_settings') {
+      if (data.settings !== undefined && (!data.settings || typeof data.settings !== 'object' || Array.isArray(data.settings))) {
+        return createBadRequestResponse('invalidSettingsFormat');
+      }
       const settings = data.settings || {};
+      if (
+        settings.password !== undefined &&
+        settings.password !== null &&
+        settings.password !== '' &&
+        (typeof settings.password !== 'string' || settings.password.length > LOGIN_PASSWORD_MAX_LENGTH)
+      ) {
+        return createBadRequestResponse('invalidPassword');
+      }
       if (!String(sys?.password || '').trim() && !String(settings.password || '')) {
         return createBadRequestResponse('passwordRequired');
       }
+
       const normalizedThemeUrl = normalizeThemeUrl(settings.theme_url);
       if (normalizedThemeUrl === null) {
         return createBadRequestResponse('invalidThemeUrl');
@@ -781,16 +1104,28 @@ export async function handleAdminAPI(request, env, sys, loadFullSettings = null,
       }
 
       // 如果 turnstile_enabled 或 turnstile_login_enabled 开启，验证 turnstile_site_key 和 turnstile_secret_key 都不为空
-      if (settings.turnstile_enabled === 'true' || settings.turnstile_enabled === true || settings.turnstile_login_enabled === 'true' || settings.turnstile_login_enabled === true) {
-        if (!settings.turnstile_site_key || settings.turnstile_site_key.trim().length === 0) {
+      const effectiveTurnstileEnabled = settings.turnstile_enabled !== undefined
+        ? normalizeBooleanSetting(settings.turnstile_enabled) === 'true'
+        : normalizeBooleanSetting(sys?.turnstile_enabled) === 'true';
+      const effectiveTurnstileLoginEnabled = settings.turnstile_login_enabled !== undefined
+        ? normalizeBooleanSetting(settings.turnstile_login_enabled) === 'true'
+        : normalizeBooleanSetting(sys?.turnstile_login_enabled) === 'true';
+      if (effectiveTurnstileEnabled || effectiveTurnstileLoginEnabled) {
+        const effectiveSiteKey = settings.turnstile_site_key !== undefined
+          ? settings.turnstile_site_key
+          : sys?.turnstile_site_key;
+        const effectiveSecretKey = settings.turnstile_secret_key !== undefined
+          ? settings.turnstile_secret_key
+          : sys?.turnstile_secret_key;
+        if (typeof effectiveSiteKey !== 'string' || effectiveSiteKey.trim().length === 0) {
           return createBadRequestResponse('turnstileSiteKeyRequired');
         }
-        if (!settings.turnstile_secret_key || settings.turnstile_secret_key.trim().length === 0) {
+        if (typeof effectiveSecretKey !== 'string' || effectiveSecretKey.trim().length === 0) {
           return createBadRequestResponse('turnstileSecretKeyRequired');
         }
       }
 
-      // 如果 tg_notify 或 expire_reminder 开启，验证 tg_bot_token 不为空
+      // 如果 tg_notify、expire_reminder 或资源告警开启，验证通知渠道配置非空
       const hasResourceAlertRulesInput = settings.resource_alert_rules !== undefined;
       const tgNotify = settings.tg_notify !== undefined
         ? normalizeTgNotify(settings.tg_notify)
@@ -814,12 +1149,12 @@ export async function handleAdminAPI(request, env, sys, loadFullSettings = null,
           ? settings.tg_bot_token
           : sys?.tg_bot_token;
         if (webhookEnabled) {
-          if (!effectiveWebhookUrl || String(effectiveWebhookUrl).trim().length === 0) {
+          if (!effectiveWebhookUrl || typeof effectiveWebhookUrl !== 'string' || effectiveWebhookUrl.trim().length === 0) {
             return createBadRequestResponse('notificationWebhookUrlRequired');
           }
         } else if (isSmtpNotificationTarget(effectiveTgBotToken)) {
           // SMTP 邮件渠道（smtp:// 前缀）视为有效的内置通知目标，允许通过告警门槛校验
-        } else if (!effectiveTgBotToken || String(effectiveTgBotToken).trim().length === 0) {
+        } else if (!effectiveTgBotToken || typeof effectiveTgBotToken !== 'string' || effectiveTgBotToken.trim().length === 0) {
           return createBadRequestResponse('tgBotTokenRequired');
         }
       }
@@ -829,14 +1164,26 @@ export async function handleAdminAPI(request, env, sys, loadFullSettings = null,
         return createBadRequestResponse('invalidPingNodeFormat');
       }
 
-      // UA 必须在任何写库动作之前校验：否则非法值会留下「外观已保存、站点设置未保存」的半成品状态。
+      // UA 与文本设置项必须在任何写库动作之前完成校验，防止出现部分写库的半成品状态。
       let normalizedUserAgent = '';
       if (settings.ua !== undefined) {
+        if (settings.ua !== null && typeof settings.ua !== 'string') {
+          return createBadRequestResponse('invalidUserAgent');
+        }
         const uaResult = validateUserAgent(settings.ua);
         if (!uaResult.valid) {
           return createBadRequestResponse('invalidUserAgent');
         }
         normalizedUserAgent = uaResult.value;
+      }
+
+      for (const textField of Object.keys(TEXT_SETTING_MAX_LENGTHS)) {
+        if (settings[textField] !== undefined) {
+          const check = validateTextSetting(textField, settings[textField]);
+          if (!check.valid) {
+            return createBadRequestResponse(`invalidSetting:${textField}`);
+          }
+        }
       }
 
       if (settings.appearance_options !== undefined && (
@@ -847,15 +1194,44 @@ export async function handleAdminAPI(request, env, sys, loadFullSettings = null,
         return createBadRequestResponse('invalidThemeOptionsFormat');
       }
 
+      const nestedAppearanceOptions = settings.appearance_options || {};
+      if (nestedAppearanceOptions.theme_options !== undefined && !isValidThemeOptions(nestedAppearanceOptions.theme_options)) {
+        return createBadRequestResponse('invalidThemeOptionsFormat');
+      }
+      for (const textField of Object.keys(TEXT_SETTING_MAX_LENGTHS)) {
+        if (nestedAppearanceOptions[textField] !== undefined) {
+          const check = validateTextSetting(textField, nestedAppearanceOptions[textField]);
+          if (!check.valid) {
+            return createBadRequestResponse(`invalidSetting:${textField}`);
+          }
+        }
+      }
+
       const shouldSaveAppearanceOptions = hasAppearanceInput(settings);
-      const appearanceOptions = {};
+      let appearanceOptions = {};
 
       if (shouldSaveAppearanceOptions) {
-        const nestedAppearanceOptions = settings.appearance_options || {};
+        let existingAppearanceOptions = {};
+        try {
+          const existingRow = await env.DB.prepare(
+            "SELECT value FROM settings WHERE key = 'appearance_options'"
+          ).first();
+          if (existingRow && existingRow.value) {
+            const parsed = JSON.parse(existingRow.value);
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+              existingAppearanceOptions = parsed;
+            }
+          }
+        } catch (_) {
+          existingAppearanceOptions = {};
+        }
+
+        appearanceOptions = { ...existingAppearanceOptions };
         for (const field of APPEARANCE_FIELDS) {
-          const value = field === 'theme_options' ? nestedAppearanceOptions.theme_options : settings[field];
+          const value = field === 'theme_options'
+            ? nestedAppearanceOptions.theme_options
+            : (settings[field] !== undefined ? settings[field] : nestedAppearanceOptions[field]);
           if (value !== undefined) {
-            // CSP 字段格式校验：只允许 https:// 开头的域名，逗号分隔
             if (field === 'csp_static' || field === 'csp_api') {
               appearanceOptions[field] = sanitizeCspDomains(value);
             } else if (field === 'display_mode') {
@@ -865,10 +1241,9 @@ export async function handleAdminAPI(request, env, sys, loadFullSettings = null,
             } else if (field === 'default_language') {
               appearanceOptions[field] = normalizeDefaultLanguage(value);
             } else if (field === 'theme_options') {
-              if (!isValidThemeOptions(value)) {
-                return createBadRequestResponse('invalidThemeOptionsFormat');
-              }
               appearanceOptions[field] = value;
+            } else if (field in TEXT_SETTING_MAX_LENGTHS) {
+              appearanceOptions[field] = validateTextSetting(field, value).value;
             } else {
               appearanceOptions[field] = value;
             }
@@ -880,13 +1255,21 @@ export async function handleAdminAPI(request, env, sys, loadFullSettings = null,
         clearAppearanceSettingsCache();
       }
 
+      const isPasswordChanged = typeof settings.password === 'string' && settings.password.length > 0;
+      const previousUsername = String(sys?.username || '').trim();
+      const incomingUsername = settings.username !== undefined ? String(settings.username ?? '').trim() : previousUsername;
+      const isUsernameChanged = settings.username !== undefined && incomingUsername !== previousUsername;
+
       const siteOptions = {};
       for (const field of SITE_FIELDS) {
+        if (field === 'jwt_secret') continue;
         if (settings[field] !== undefined) {
           if (field === 'password') {
-            if (settings[field] && settings[field].length > 0) {
+            if (isPasswordChanged) {
               siteOptions[field] = await hashPassword(settings[field]);
             }
+          } else if (field === 'username') {
+            siteOptions[field] = incomingUsername;
           } else if (PING_NODE_FIELDS.includes(field)) {
             siteOptions[field] = pingNodes.values[field];
           } else if (field === 'tg_notify') {
@@ -899,13 +1282,9 @@ export async function handleAdminAPI(request, env, sys, loadFullSettings = null,
             siteOptions[field] = normalizeFrontendWsTimeoutMinutes(settings[field]);
           } else if (field === 'resource_alert_rules') {
             siteOptions[field] = normalizedResourceAlertRules;
-          } else if (field === 'wss_report_enabled') {
-            siteOptions[field] = normalizeBooleanSetting(settings[field]);
           } else if (field === 'wss_report_hours') {
             siteOptions[field] = normalizeWssReportHours(settings[field]);
-          } else if (field === 'auto_discovery') {
-            siteOptions[field] = normalizeBooleanSetting(settings[field]);
-          } else if (field === 'show_three_net_details') {
+          } else if (BOOLEAN_SITE_SETTING_FIELDS.has(field)) {
             siteOptions[field] = normalizeBooleanSetting(settings[field]);
           } else if (field === 'notification_timezone') {
             siteOptions[field] = normalizeNotificationTimezone(settings[field]);
@@ -913,8 +1292,6 @@ export async function handleAdminAPI(request, env, sys, loadFullSettings = null,
             siteOptions[field] = normalizeNotificationLanguage(settings[field]);
           } else if (field === 'expire_notification_time') {
             siteOptions[field] = normalizeExpireNotificationTime(settings[field]);
-          } else if (field === 'notification_webhook_enabled') {
-            siteOptions[field] = normalizeBooleanSetting(settings[field]);
           } else if (field === 'notification_webhook_method') {
             siteOptions[field] = normalizeNotificationWebhookMethod(settings[field]);
           } else if (field === 'notification_webhook_format') {
@@ -925,45 +1302,73 @@ export async function handleAdminAPI(request, env, sys, loadFullSettings = null,
             siteOptions[field] = normalizeNotificationWebhookBody(settings[field]);
           } else if (field === 'notification_template') {
             siteOptions[field] = normalizeNotificationTemplate(settings[field]);
+          } else if (field === 'traffic_alert_threshold') {
+            siteOptions[field] = normalizeTrafficAlertThreshold(settings[field]);
           } else if (field === 'theme_url') {
             siteOptions[field] = normalizedThemeUrl;
           } else if (field === 'ua') {
             siteOptions[field] = normalizedUserAgent;
+          } else if (field in TEXT_SETTING_MAX_LENGTHS) {
+            siteOptions[field] = validateTextSetting(field, settings[field]).value;
           } else {
             siteOptions[field] = settings[field];
           }
         }
       }
+
+      if (isPasswordChanged || isUsernameChanged) {
+        siteOptions.jwt_secret = generateRandomSecret(32);
+      }
+
       await saveSiteOptions(env.DB, siteOptions);
-      // 保存设置后非致命补列：确保 servers 表的告警相关列存在，避免启用月流量阈值后
-      // 告警状态因缺列无法持久化而重复发送通知。设置已保存成功，补列失败不回滚、不报错。
       try {
         await addServerColumns(env.DB);
       } catch (e) {
         console.error('[settings-save] 保存设置后补列失败:', e);
       }
       const shouldCloseAgentWssReports = !isWssReportEnabled({ ...sys, ...siteOptions });
-      // Keep existing states on rule edits so threshold increases can emit recovery notifications.
-      // checkResourceAlerts prunes states for removed rules or servers on the next evaluation.
       if (hasResourceAlertRulesInput && !resourceAlertEnabled) {
         await clearResourceAlertState(env.DB);
       }
-      Object.assign(sys, shouldSaveAppearanceOptions ? appearanceOptions : {}, siteOptions);
+      if (sys && typeof sys === 'object') {
+        Object.assign(sys, shouldSaveAppearanceOptions ? appearanceOptions : {}, siteOptions);
+      }
       if (shouldCloseAgentWssReports && (
         settings.wss_report_enabled !== undefined ||
         settings.wss_report_hours !== undefined
       )) {
         scheduleAgentReportModeChanged(env, ctx);
       }
+      scheduleBroadcasterInvalidate(env, ctx, { refreshSettings: true });
+
+      if (isPasswordChanged || isUsernameChanged) {
+        const tokenContext = sys && typeof sys === 'object' ? sys : siteOptions;
+        const newToken = await generateToken(env, tokenContext);
+        return createSuccessResponse({
+          success: true,
+          token: newToken,
+          message: 'updateSuccess'
+        }, {
+          'Set-Cookie': buildAuthCookie(request, newToken)
+        });
+      }
+
       return createSuccessResponse({
         success: true,
         message: 'updateSuccess'
       });
     } 
-    else if (data.action === 'add') {
+    else if (action === 'add') {
       const name = data.name || 'New Server';
       if (!isValidName(name)) {
         return createBadRequestResponse('invalidServerName');
+      }
+      if (
+        data.server_group !== undefined &&
+        data.server_group !== null &&
+        (typeof data.server_group === 'object' || typeof data.server_group === 'boolean' || String(data.server_group).trim().length > 64)
+      ) {
+        return createBadRequestResponse('invalidServerGroup');
       }
       const networkInterfaces = normalizeNetworkInterfaceField(data.interface);
       if (!networkInterfaces.valid) {
@@ -971,20 +1376,31 @@ export async function handleAdminAPI(request, env, sys, loadFullSettings = null,
       }
       
       const id = crypto.randomUUID();
-      const group = data.server_group || 'Default';
+      const group = String(data.server_group ?? '').trim() || 'Default';
       const region = normalizeServerRegion(data.region);
 
       try {
-        const { max_order } = await env.DB.prepare('SELECT COALESCE(MAX(sort_order), -1) as max_order FROM servers').first();
-        const sortOrder = (max_order || 0) + 1;
+        const orderRow = await env.DB.prepare('SELECT COALESCE(MAX(sort_order), -1) as max_order FROM servers').first();
+        const maxOrder = orderRow?.max_order;
+        const sortOrder = (Number.isFinite(Number(maxOrder)) ? Math.trunc(Number(maxOrder)) : -1) + 1;
 
-        const historyPartitionId = await getNextServerHistoryPartitionId(env.DB);
-
-        await env.DB.prepare(`
-          INSERT INTO servers
-          (id, name, server_group, region, "interface", sort_order, history_partition_id, timestamp)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        `).bind(id, name, group, region, networkInterfaces.value, sortOrder, historyPartitionId, Date.now()).run();
+        const MAX_PARTITION_RETRIES = 3;
+        for (let attempt = 0; attempt < MAX_PARTITION_RETRIES; attempt++) {
+          const historyPartitionId = await getNextServerHistoryPartitionId(env.DB);
+          try {
+            await env.DB.prepare(`
+              INSERT INTO servers
+              (id, name, server_group, region, "interface", sort_order, history_partition_id, timestamp)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            `).bind(id, name.trim(), group, region, networkInterfaces.value, sortOrder, historyPartitionId, Date.now()).run();
+            break;
+          } catch (insertError) {
+            if (isHistoryPartitionUniqueError(insertError) && attempt < MAX_PARTITION_RETRIES - 1) {
+              continue;
+            }
+            throw insertError;
+          }
+        }
       } catch (e) {
         return handleServerMutationError(env.DB, e, 'serverAddFailed');
       }
@@ -997,33 +1413,42 @@ export async function handleAdminAPI(request, env, sys, loadFullSettings = null,
         message: 'serverAdded'
       });
     } 
-    else if (data.action === 'delete') {
+    else if (action === 'delete') {
       const { id } = data;
-      if (!id || !isValidUUID(id)) {
+      if (!id || typeof id !== 'string' || !isValidUUID(id)) {
         return createBadRequestResponse('invalidServerId');
       }
       
       await deleteServer(env.DB, id);
       
       clearServersListCache();
+      clearLatestReportCache(id);
+      scheduleBroadcasterInvalidate(env, ctx, { deletedServerIds: [id] });
       
       return createSuccessResponse({ 
         success: true, 
         message: 'serverDeleted'
       });
     } 
-    else if (data.action === 'save_order') {
+    else if (action === 'save_order') {
       const { orders } = data;
       if (!orders || !Array.isArray(orders) || orders.length === 0) {
         return createBadRequestResponse('missingSortData');
       }
-      
+      if (orders.length > ADMIN_MAX_BATCH_ITEMS) {
+        return createBadRequestResponse('tooManyServers');
+      }
+
       for (let i = 0; i < orders.length; i++) {
-        if (!isValidUUID(orders[i])) {
+        if (typeof orders[i] !== 'string' || !isValidUUID(orders[i])) {
           return createBadRequestResponse('invalidSortId');
         }
-        await env.DB.prepare('UPDATE servers SET sort_order = ? WHERE id = ?').bind(i, orders[i]).run();
       }
+
+      const statements = orders.map((orderId, index) =>
+        env.DB.prepare('UPDATE servers SET sort_order = ? WHERE id = ?').bind(index, orderId)
+      );
+      await executeBatchedStatements(env.DB, statements, D1_MUTATION_BATCH_SIZE);
       
       clearServersListCache();
       
@@ -1032,11 +1457,36 @@ export async function handleAdminAPI(request, env, sys, loadFullSettings = null,
         message: 'sortOrderSaved'
       });
     }
-    else if (data.action === 'edit') {
+    else if (action === 'edit') {
       const { id, name, server_group, region, tags, note, price, billing_cycle, auto_renewal, currency, expire_date, traffic_limit, traffic_calc_type, traffic_alert_percent, interface: networkInterfaceInput, reset_day, collect_interval, report_interval, wss_report_interval, connection_mode, ping_mode, auto_update, custom_ct, custom_cu, custom_cm, custom_bd, node_1, node_2, node_3, node_4, rx_correction, tx_correction, offline_notify_disabled, is_hidden } = data;
-      if (!id || !isValidUUID(id)) {
+      if (!id || typeof id !== 'string' || !isValidUUID(id)) {
         return createBadRequestResponse('invalidServerId');
       }
+      if (!isValidName(name || '')) {
+        return createBadRequestResponse('invalidServerName');
+      }
+      if (
+        server_group !== undefined &&
+        server_group !== null &&
+        (typeof server_group === 'object' || typeof server_group === 'boolean' || String(server_group).trim().length > 64)
+      ) {
+        return createBadRequestResponse('invalidServerGroup');
+      }
+      if (
+        traffic_limit !== undefined &&
+        traffic_limit !== null &&
+        (typeof traffic_limit === 'object' || typeof traffic_limit === 'boolean' || String(traffic_limit).trim().length > 32)
+      ) {
+        return createBadRequestResponse('invalidTrafficLimit');
+      }
+      const trimmedExpireDate = expire_date === undefined || expire_date === null ? '' : String(expire_date).trim();
+      if (trimmedExpireDate && !parseDateOnly(trimmedExpireDate)) {
+        return createBadRequestResponse('invalidExpireDate');
+      }
+      if ((tags !== undefined && tags !== null && typeof tags === 'object') || (note !== undefined && note !== null && typeof note === 'object')) {
+        return createBadRequestResponse('invalidFieldFormat');
+      }
+
       const effectiveConnectionMode = isWssReportConfigured(sys) ? connection_mode : 'http';
       const agentConfigResult = validateAgentConfigInput({
         collect_interval,
@@ -1066,6 +1516,11 @@ export async function handleAdminAPI(request, env, sys, loadFullSettings = null,
         .slice(0, 12)
         .join(',');
       const safeNote = String(note || '').trim().slice(0, 500);
+      const safeGroup = String(server_group ?? '').trim() || 'Default';
+      const safeTrafficLimit = traffic_limit === undefined || traffic_limit === null ? '' : String(traffic_limit).trim();
+      const safeTrafficCalcType = VALID_TRAFFIC_CALC_TYPES.has(String(traffic_calc_type || 'total'))
+        ? String(traffic_calc_type || 'total')
+        : 'total';
 
       const toNullCorrection = (v) => {
         if (v === null || v === undefined || v === '') return null;
@@ -1082,7 +1537,7 @@ export async function handleAdminAPI(request, env, sys, loadFullSettings = null,
         billing_cycle,
         auto_renewal,
         currency,
-        expire_date
+        expire_date: trimmedExpireDate
       });
       
       try {
@@ -1091,8 +1546,8 @@ export async function handleAdminAPI(request, env, sys, loadFullSettings = null,
           SET name = ?, server_group = ?, region = ?, tags = ?, note = ?, price = ?, billing_cycle = ?, auto_renewal = ?, currency = ?, expire_date = ?, traffic_limit = ?, traffic_calc_type = ?, "interface" = ?, reset_day = ?, collect_interval = ?, report_interval = ?, wss_report_interval = ?, connection_mode = ?, ping_mode = ?, auto_update = ?, custom_ct = ?, custom_cu = ?, custom_cm = ?, custom_bd = ?, node_1 = ?, node_2 = ?, node_3 = ?, node_4 = ?, rx_correction = ?, tx_correction = ?, offline_notify_disabled = ?, is_hidden = ?, traffic_alert_percent = ?
           WHERE id = ?
         `).bind(
-          name || '',
-          server_group || 'Default',
+          name.trim(),
+          safeGroup,
           normalizeServerRegion(region),
           safeTags,
           safeNote,
@@ -1101,8 +1556,8 @@ export async function handleAdminAPI(request, env, sys, loadFullSettings = null,
           billingData.auto_renewal,
           billingData.currency,
           billingData.expire_date,
-          traffic_limit || '',
-          traffic_calc_type || 'total',
+          safeTrafficLimit,
+          safeTrafficCalcType,
           networkInterfaces.value,
           normalizedAgentConfig.reset_day,
           normalizedAgentConfig.collect_interval,
@@ -1131,30 +1586,36 @@ export async function handleAdminAPI(request, env, sys, loadFullSettings = null,
       }
       
       clearServersListCache();
+      clearLatestReportCache(id);
       scheduleAgentConfigChanged(env, ctx, id);
+      scheduleBroadcasterInvalidate(env, ctx, { updatedServerIds: [id] });
       
       return createSuccessResponse({ 
         success: true, 
         message: 'serverUpdated'
       });
     }
-    else if (data.action === 'batch_delete') {
+    else if (action === 'batch_delete') {
       const { ids } = data;
       if (!ids || !Array.isArray(ids) || ids.length === 0) {
         return createBadRequestResponse('selectServersToDelete');
       }
-      
+      if (ids.length > ADMIN_MAX_BATCH_ITEMS) {
+        return createBadRequestResponse('tooManyServers');
+      }
+
       for (const id of ids) {
-        if (!isValidUUID(id)) {
+        if (typeof id !== 'string' || !isValidUUID(id)) {
           return createBadRequestResponse('invalidServerIdInList');
         }
       }
-      
-      for (const id of ids) {
-        await deleteServer(env.DB, id);
-      }
+
+      const uniqueIds = Array.from(new Set(ids));
+      await deleteServersAndHistory(env.DB, uniqueIds);
       
       clearServersListCache();
+      clearLatestReportCache(uniqueIds);
+      scheduleBroadcasterInvalidate(env, ctx, { deletedServerIds: uniqueIds });
       
       return createSuccessResponse({ 
         success: true, 
@@ -1162,7 +1623,7 @@ export async function handleAdminAPI(request, env, sys, loadFullSettings = null,
       });
     }
     
-    else if (data.action === 'export_servers') {
+    else if (action === 'export_servers') {
       try {
         const servers = await env.DB.prepare('SELECT * FROM servers ORDER BY sort_order ASC').all();
         return createSuccessResponse({
@@ -1174,14 +1635,15 @@ export async function handleAdminAPI(request, env, sys, loadFullSettings = null,
         return createBadRequestResponse('serversExportFailed');
       }
     }
-    else if (data.action === 'import_servers') {
+    else if (action === 'import_servers') {
       const { servers: importData } = data;
       if (!importData || !Array.isArray(importData) || importData.length === 0) {
         return createBadRequestResponse('noServersToImport');
       }
+      if (importData.length > ADMIN_MAX_BATCH_ITEMS) {
+        return createBadRequestResponse('tooManyServers');
+      }
 
-      // 导入前先补列：INSERT 显式写入 traffic_alert_percent，缺列会导致每条导入全部跳过
-      // 且不自动补列，与单个新增/编辑的行为不一致。此处先确保列存在（非致命，失败仍继续导入）。
       try {
         await addServerColumns(env.DB);
       } catch (e) {
@@ -1191,30 +1653,169 @@ export async function handleAdminAPI(request, env, sys, loadFullSettings = null,
       const existingServers = await env.DB.prepare('SELECT id FROM servers').all();
       const existingIds = new Set((existingServers.results || []).map(s => s.id));
 
-      const existingPartitionIds = await env.DB.prepare('SELECT history_partition_id FROM servers').all();
+      const existingPartitionIds = await env.DB.prepare(
+        'SELECT history_partition_id FROM servers WHERE history_partition_id > 0'
+      ).all();
       const usedPartitionIds = new Set(
-        (existingPartitionIds.results || []).map(s => s.history_partition_id).filter(id => id > 0)
+        (existingPartitionIds.results || [])
+          .map(s => Number(s.history_partition_id))
+          .filter(id => Number.isInteger(id) && id > 0 && id <= HISTORY_MAX_PARTITION_ID)
       );
 
       let imported = 0;
       let skipped = 0;
       const skippedIds = [];
+      const pendingInserts = [];
+      const IMPORT_BATCH_SIZE = 50;
+      const importNow = Date.now();
+      const PARTITION_COLUMN_INDEX = IMPORT_SERVER_COLUMNS.indexOf('history_partition_id');
+      const insertSql = `INSERT INTO servers (${IMPORT_SERVER_COLUMNS.join(', ')}) VALUES (${IMPORT_SERVER_PLACEHOLDERS})`;
+
+      const toOptionalInt = (val, fallback) => {
+        if (val === undefined || val === null || val === '') return fallback;
+        if (typeof val === 'object' || typeof val === 'boolean') return NaN;
+        const n = Number(val);
+        return Number.isInteger(n) ? n : NaN;
+      };
 
       for (const server of importData) {
-        if (!server.id || !isValidUUID(server.id)) {
+        if (!server || typeof server !== 'object' || Array.isArray(server)) {
           skipped++;
-          skippedIds.push(server.id || '(invalid)');
+          skippedIds.push('(invalid)');
           continue;
         }
 
-        if (existingIds.has(server.id)) {
+        const serverId = typeof server.id === 'string' ? server.id.trim() : '';
+        if (!serverId || !isValidUUID(serverId)) {
           skipped++;
-          skippedIds.push(server.id);
+          skippedIds.push(String(server?.id || '(invalid)').slice(0, 64));
           continue;
         }
 
-        let partitionId = Number(server.history_partition_id) || 0;
-        if (partitionId <= 0 || partitionId > HISTORY_MAX_PARTITION_ID || usedPartitionIds.has(partitionId)) {
+        if (existingIds.has(serverId)) {
+          skipped++;
+          skippedIds.push(serverId);
+          continue;
+        }
+
+        const serverName = typeof server.name === 'string' ? server.name.trim() : '';
+        if (!isValidName(serverName)) {
+          skipped++;
+          skippedIds.push(serverId);
+          continue;
+        }
+
+        const safeSortOrder = toOptionalInt(server.sort_order, 0);
+        if (!Number.isInteger(safeSortOrder) || safeSortOrder < -1000000 || safeSortOrder > 1000000) {
+          skipped++;
+          skippedIds.push(serverId);
+          continue;
+        }
+
+        const trimmedExpireDate = server.expire_date === undefined || server.expire_date === null
+          ? ''
+          : String(server.expire_date).trim();
+        if (trimmedExpireDate && !parseDateOnly(trimmedExpireDate)) {
+          skipped++;
+          skippedIds.push(serverId);
+          continue;
+        }
+
+        if (
+          (server.server_group !== undefined && server.server_group !== null && (typeof server.server_group === 'object' || typeof server.server_group === 'boolean' || String(server.server_group).trim().length > 64)) ||
+          (server.traffic_limit !== undefined && server.traffic_limit !== null && (typeof server.traffic_limit === 'object' || typeof server.traffic_limit === 'boolean' || String(server.traffic_limit).trim().length > 32)) ||
+          (server.tags !== undefined && server.tags !== null && (typeof server.tags === 'object' || typeof server.tags === 'boolean' || String(server.tags).length > 512)) ||
+          (server.note !== undefined && server.note !== null && (typeof server.note === 'object' || typeof server.note === 'boolean' || String(server.note).length > 500))
+        ) {
+          skipped++;
+          skippedIds.push(serverId);
+          continue;
+        }
+
+        const collectInterval = toOptionalInt(server.collect_interval, 0);
+        const reportInterval = toOptionalInt(server.report_interval, 60);
+        const resetDay = toOptionalInt(server.reset_day, 1);
+        const wssReportInterval = server.wss_report_interval === undefined || server.wss_report_interval === null || server.wss_report_interval === ''
+          ? normalizeWssReportInterval(undefined)
+          : toOptionalInt(server.wss_report_interval, NaN);
+        const agentConfigCheck = validateAgentConfigInput({
+          collect_interval: collectInterval,
+          report_interval: reportInterval,
+          wss_report_interval: wssReportInterval,
+          reset_day: resetDay,
+          connection_mode: server.connection_mode || 'auto',
+          ping_mode: server.ping_mode || 'tcp'
+        });
+        if (!agentConfigCheck.valid) {
+          skipped++;
+          skippedIds.push(serverId);
+          continue;
+        }
+
+        const pingNodeValues = {};
+        let pingNodesValid = true;
+        for (const field of PING_NODE_FIELDS) {
+          const rawNode = server[field];
+          if (rawNode === undefined || rawNode === null || rawNode === '') {
+            pingNodeValues[field] = '';
+          } else if (rawNode === 0 || rawNode === '0') {
+            pingNodeValues[field] = '0';
+          } else {
+            const check = validatePingNode(rawNode);
+            if (!check.valid) {
+              pingNodesValid = false;
+              break;
+            }
+            pingNodeValues[field] = check.value;
+          }
+        }
+        if (!pingNodesValid) {
+          skipped++;
+          skippedIds.push(serverId);
+          continue;
+        }
+
+        const networkInterfaces = normalizeNetworkInterfaceField(server.interface);
+        if (!networkInterfaces.valid) {
+          skipped++;
+          skippedIds.push(serverId);
+          continue;
+        }
+
+        const toImportedCorrection = (v) => {
+          if (v === null || v === undefined || v === '') return null;
+          return isValidTrafficCorrection(v) ? Number(v) : undefined;
+        };
+        const safeRxCorrection = toImportedCorrection(server.rx_correction);
+        const safeTxCorrection = toImportedCorrection(server.tx_correction);
+        if (safeRxCorrection === undefined || safeTxCorrection === undefined) {
+          skipped++;
+          skippedIds.push(serverId);
+          continue;
+        }
+
+        let safeTimestamp = importNow;
+        if (server.timestamp !== undefined && server.timestamp !== null && server.timestamp !== '' && server.timestamp !== 0 && server.timestamp !== '0') {
+          if (typeof server.timestamp === 'object' || typeof server.timestamp === 'boolean') {
+            skipped++;
+            skippedIds.push(serverId);
+            continue;
+          }
+          const parsedTs = Number(server.timestamp);
+          if (
+            !Number.isFinite(parsedTs) ||
+            parsedTs < IMPORT_MIN_TIMESTAMP_MS ||
+            parsedTs > importNow + IMPORT_MAX_FUTURE_DRIFT_MS
+          ) {
+            skipped++;
+            skippedIds.push(serverId);
+            continue;
+          }
+          safeTimestamp = Math.trunc(parsedTs);
+        }
+
+        let partitionId = Number(server.history_partition_id);
+        if (!Number.isInteger(partitionId) || partitionId <= 0 || partitionId > HISTORY_MAX_PARTITION_ID || usedPartitionIds.has(partitionId)) {
           partitionId = 0;
           for (let id = 1; id <= HISTORY_MAX_PARTITION_ID; id++) {
             if (!usedPartitionIds.has(id)) {
@@ -1224,75 +1825,148 @@ export async function handleAdminAPI(request, env, sys, loadFullSettings = null,
           }
           if (partitionId === 0) {
             skipped++;
-            skippedIds.push(server.id);
+            skippedIds.push(serverId);
             continue;
           }
         }
 
         usedPartitionIds.add(partitionId);
-        existingIds.add(server.id);
+        existingIds.add(serverId);
 
-        const billingData = normalizeServerBillingData(server);
-        const networkInterfaces = normalizeNetworkInterfaceField(server.interface);
-        if (!networkInterfaces.valid) {
-          skipped++;
-          skippedIds.push(server.id);
-          continue;
+        const billingData = normalizeServerBillingData({
+          ...server,
+          expire_date: trimmedExpireDate
+        });
+        const safeGroup = String(server.server_group ?? '').trim() || 'Default';
+        const safeTags = String(server.tags || '')
+          .split(',')
+          .map(tag => tag.trim().replace(/[^\p{L}\p{N} ._\-]/gu, '').slice(0, 32))
+          .filter(Boolean)
+          .slice(0, 12)
+          .join(',');
+        const safeNote = String(server.note || '').trim().slice(0, 500);
+        const safeTrafficLimit = server.traffic_limit === undefined || server.traffic_limit === null
+          ? ''
+          : String(server.traffic_limit).trim();
+        const safeTrafficCalcType = VALID_TRAFFIC_CALC_TYPES.has(String(server.traffic_calc_type || 'total'))
+          ? String(server.traffic_calc_type || 'total')
+          : 'total';
+
+        const bindValues = [
+          serverId,
+          serverName,
+          safeGroup,
+          normalizeServerRegion(server.region),
+          safeTags,
+          safeNote,
+          billingData.price,
+          billingData.billing_cycle,
+          billingData.auto_renewal,
+          billingData.currency,
+          billingData.expire_date,
+          safeTrafficLimit,
+          safeTrafficCalcType,
+          networkInterfaces.value,
+          agentConfigCheck.config.reset_day,
+          agentConfigCheck.config.collect_interval,
+          agentConfigCheck.config.report_interval,
+          agentConfigCheck.config.wss_report_interval,
+          normalizeConnectionMode(server.connection_mode) || 'auto',
+          normalizePingMode(server.ping_mode) || 'tcp',
+          normalizeBooleanFlag(server.auto_update),
+          pingNodeValues.custom_ct,
+          pingNodeValues.custom_cu,
+          pingNodeValues.custom_cm,
+          pingNodeValues.custom_bd,
+          pingNodeValues.node_1,
+          pingNodeValues.node_2,
+          pingNodeValues.node_3,
+          pingNodeValues.node_4,
+          safeRxCorrection,
+          safeTxCorrection,
+          normalizeBooleanFlag(server.offline_notify_disabled),
+          normalizeBooleanFlag(server.is_hidden),
+          safeSortOrder,
+          partitionId,
+          safeTimestamp,
+          normalizePctOrNull(server.traffic_alert_percent)
+        ];
+
+        pendingInserts.push({
+          id: serverId,
+          bindValues,
+          statement: env.DB.prepare(insertSql).bind(...bindValues)
+        });
+        imported++;
+      }
+
+      const importedServerIds = [];
+      const insertSingleItemWithRetry = async (item) => {
+        let rowInserted = false;
+        let currentStmt = item.statement;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            await currentStmt.run();
+            rowInserted = true;
+            break;
+          } catch (rowError) {
+            if (isHistoryPartitionUniqueError(rowError) && attempt < 2 && PARTITION_COLUMN_INDEX >= 0) {
+              try {
+                const nextPid = await getNextServerHistoryPartitionId(env.DB);
+                usedPartitionIds.add(nextPid);
+                const nextValues = [...item.bindValues];
+                nextValues[PARTITION_COLUMN_INDEX] = nextPid;
+                currentStmt = env.DB.prepare(insertSql).bind(...nextValues);
+                continue;
+              } catch (allocError) {
+                console.warn('[import_servers] partition reallocation failed:', {
+                  id: item.id,
+                  error: allocError?.message || String(allocError)
+                });
+              }
+            }
+            console.warn('[import_servers] failed to insert server row:', {
+              id: item.id,
+              error: rowError?.message || String(rowError)
+            });
+            break;
+          }
         }
-
-        try {
-          await env.DB.prepare(`
-            INSERT INTO servers (id, name, server_group, region, tags, note, price, billing_cycle, auto_renewal,
-              currency, expire_date,
-              traffic_limit, traffic_calc_type, "interface", reset_day, collect_interval, report_interval, wss_report_interval, connection_mode, ping_mode,
-              auto_update, custom_ct, custom_cu, custom_cm, custom_bd, node_1, node_2, node_3, node_4, rx_correction, tx_correction,
-              offline_notify_disabled, is_hidden, sort_order, history_partition_id, timestamp, traffic_alert_percent)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-          `).bind(
-            server.id,
-            server.name || '',
-            server.server_group || 'Default',
-            normalizeServerRegion(server.region),
-            server.tags || '',
-            server.note || '',
-            billingData.price,
-            billingData.billing_cycle,
-            billingData.auto_renewal,
-            billingData.currency,
-            billingData.expire_date,
-            server.traffic_limit || '',
-            server.traffic_calc_type || 'total',
-            networkInterfaces.value,
-            server.reset_day ?? 1,
-            server.collect_interval ?? 0,
-            server.report_interval ?? 60,
-            normalizeWssReportInterval(server.wss_report_interval),
-            normalizeConnectionMode(server.connection_mode) || 'auto',
-            normalizePingMode(server.ping_mode) || 'tcp',
-            normalizeBooleanFlag(server.auto_update),
-            normalizeImportedPingNodeValue(server.custom_ct),
-            normalizeImportedPingNodeValue(server.custom_cu),
-            normalizeImportedPingNodeValue(server.custom_cm),
-            normalizeImportedPingNodeValue(server.custom_bd),
-            normalizeImportedPingNodeValue(server.node_1), normalizeImportedPingNodeValue(server.node_2),
-            normalizeImportedPingNodeValue(server.node_3), normalizeImportedPingNodeValue(server.node_4),
-            server.rx_correction ?? null,
-            server.tx_correction ?? null,
-            normalizeBooleanFlag(server.offline_notify_disabled),
-            normalizeBooleanFlag(server.is_hidden),
-            server.sort_order ?? 0,
-            partitionId,
-            server.timestamp || Date.now(),
-            normalizePctOrNull(server.traffic_alert_percent)
-          ).run();
-          imported++;
-        } catch (e) {
+        if (rowInserted) {
+          importedServerIds.push(item.id);
+        } else {
+          imported--;
           skipped++;
-          skippedIds.push(server.id);
+          skippedIds.push(item.id);
+        }
+      };
+
+      for (let i = 0; i < pendingInserts.length; i += IMPORT_BATCH_SIZE) {
+        const chunk = pendingInserts.slice(i, i + IMPORT_BATCH_SIZE);
+        if (typeof env.DB.batch === 'function') {
+          try {
+            await env.DB.batch(chunk.map(item => item.statement));
+            for (const item of chunk) {
+              importedServerIds.push(item.id);
+            }
+          } catch (_) {
+            // 原子批失败说明本批无任何行落库，安全逐条重试
+            for (const item of chunk) {
+              await insertSingleItemWithRetry(item);
+            }
+          }
+        } else {
+          // 无 db.batch 的环境直接逐条执行，避免前面已落库的行在异常后重复执行
+          for (const item of chunk) {
+            await insertSingleItemWithRetry(item);
+          }
         }
       }
 
       clearServersListCache();
+      if (importedServerIds.length > 0) {
+        scheduleBroadcasterInvalidate(env, ctx, { updatedServerIds: importedServerIds });
+      }
 
       return createSuccessResponse({
         success: true,

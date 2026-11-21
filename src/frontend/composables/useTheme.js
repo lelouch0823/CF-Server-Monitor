@@ -1,5 +1,6 @@
 import { ref, onMounted } from "vue";
 import { STORAGE } from "../utils/constants";
+import { safeLocalStorage } from "../utils/storage";
 
 const STORAGE_KEY = STORAGE.THEME_PREFERENCE;
 const themeChangeCallbacks = [];
@@ -34,9 +35,11 @@ const resolveTheme = (theme) => {
 
 const applyTheme = (theme) => {
   const resolved = resolveTheme(theme);
-  document.body.classList.remove("dark", "light");
-  if (resolved !== "dark") {
-    document.body.classList.add(resolved);
+  if (typeof document !== "undefined" && document.body) {
+    document.body.classList.remove("dark", "light");
+    if (resolved !== "dark") {
+      document.body.classList.add(resolved);
+    }
   }
   themeChangeCallbacks.forEach((cb) => cb(resolved));
 };
@@ -69,12 +72,12 @@ ensureSystemThemeListener();
 
 export const useTheme = () => {
   const getPreferredTheme = () => {
-    return normalizeTheme(localStorage.getItem(STORAGE_KEY), defaultTheme);
+    return normalizeTheme(safeLocalStorage.getItem(STORAGE_KEY), defaultTheme);
   };
 
   const setTheme = (theme) => {
     const normalizedTheme = normalizeTheme(theme);
-    localStorage.setItem(STORAGE_KEY, normalizedTheme);
+    safeLocalStorage.setItem(STORAGE_KEY, normalizedTheme);
     currentTheme.value = normalizedTheme;
     applyTheme(normalizedTheme);
   };
@@ -95,6 +98,13 @@ export const useTheme = () => {
 
   const onThemeChange = (callback) => {
     themeChangeCallbacks.push(callback);
+    // 返回取消订阅函数：组件卸载时调用，避免回调闭包（图表等）常驻内存
+    return () => {
+      const index = themeChangeCallbacks.indexOf(callback);
+      if (index !== -1) {
+        themeChangeCallbacks.splice(index, 1);
+      }
+    };
   };
 
   onMounted(() => {
@@ -114,7 +124,7 @@ export const useTheme = () => {
 
 export const applyDefaultTheme = (theme) => {
   defaultTheme = normalizeTheme(theme);
-  const effectiveTheme = normalizeTheme(localStorage.getItem(STORAGE_KEY), defaultTheme);
+  const effectiveTheme = normalizeTheme(safeLocalStorage.getItem(STORAGE_KEY), defaultTheme);
   currentTheme.value = effectiveTheme;
   applyTheme(effectiveTheme);
 };

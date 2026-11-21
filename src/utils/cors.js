@@ -1,5 +1,5 @@
-function parseAllowedOrigins(corsAllowedOrigins) {
-  if (!corsAllowedOrigins || corsAllowedOrigins.trim() === '') {
+export function parseAllowedOrigins(corsAllowedOrigins) {
+  if (typeof corsAllowedOrigins !== 'string' || corsAllowedOrigins.trim() === '') {
     return [];
   }
   return corsAllowedOrigins
@@ -8,15 +8,29 @@ function parseAllowedOrigins(corsAllowedOrigins) {
     .filter(o => o !== '');
 }
 
+function resolveAllowedOrigins(allowedOriginsOrEnv) {
+  if (Array.isArray(allowedOriginsOrEnv)) {
+    return allowedOriginsOrEnv;
+  }
+  if (typeof allowedOriginsOrEnv === 'string') {
+    return parseAllowedOrigins(allowedOriginsOrEnv);
+  }
+  if (allowedOriginsOrEnv && typeof allowedOriginsOrEnv === 'object') {
+    return parseAllowedOrigins(allowedOriginsOrEnv.CORS_ALLOWED_ORIGINS);
+  }
+  return [];
+}
+
 export function getCorsAllowedOrigins(env) {
-  return parseAllowedOrigins(env.CORS_ALLOWED_ORIGINS);
+  return parseAllowedOrigins(env?.CORS_ALLOWED_ORIGINS);
 }
 
 export function isOriginAllowed(origin, allowedOrigins) {
-  if (!origin || allowedOrigins.length === 0) {
+  const normalizedAllowed = resolveAllowedOrigins(allowedOrigins);
+  if (!origin || normalizedAllowed.length === 0) {
     return false;
   }
-  return allowedOrigins.includes(origin);
+  return normalizedAllowed.includes(origin);
 }
 
 export function createCorsHeaders(origin, allowedOrigins) {

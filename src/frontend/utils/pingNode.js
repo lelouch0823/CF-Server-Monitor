@@ -5,6 +5,29 @@ const IPV6_PATTERN = /^(?:(?:[0-9a-f]{1,4}:){1,7}[0-9a-f]{1,4}|(?:[0-9a-f]{1,4}:
 
 export const PING_NODE_FIELDS = ['custom_ct', 'custom_cu', 'custom_cm', 'custom_bd', 'node_1', 'node_2', 'node_3', 'node_4']
 
+export const BUILTIN_PING_NODE_DEFAULTS = Object.freeze({
+  ct: '电信',
+  cu: '联通',
+  cm: '移动',
+  bd: 'BGP',
+  node_1: 'Node 1',
+  node_2: 'Node 2',
+  node_3: 'Node 3',
+  node_4: 'Node 4'
+})
+
+export const resolveLocalizedPingName = (rawName, builtinDefault, localizedFallback) => {
+  const fallback = (localizedFallback !== undefined && localizedFallback !== null && String(localizedFallback).trim() !== '')
+    ? String(localizedFallback)
+    : String(builtinDefault ?? '')
+  if (!rawName) return fallback
+  const trimmed = String(rawName).trim()
+  if (!trimmed || trimmed === builtinDefault) {
+    return fallback
+  }
+  return trimmed
+}
+
 const isValidIpv4 = (host) => {
   if (!IPV4_PATTERN.test(host)) return false
   return host.split('.').every(part => {

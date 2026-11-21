@@ -6,12 +6,71 @@ import {
   normalizeCurrency,
   normalizePrice
 } from './server.js'
+import { getLanguage } from './i18n.js'
+import { safeLocalStorage } from './storage.js'
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000
 const MONTH_DAYS = 30
 const LONG_TERM_YEARS = 100
 const EXCHANGE_RATE_CACHE_KEY = 'cfsm_finance_exchange_rates_cny_v1'
 const FINANCE_CURRENCY_KEY = 'cfsm_finance_currency_v1'
+
+const LANGUAGE_TO_BCP47_LOCALE = Object.freeze({
+  zh: 'zh-CN',
+  'zh-TW': 'zh-TW',
+  en: 'en-US',
+  ja: 'ja-JP',
+  id: 'id-ID',
+  fr: 'fr-FR',
+  es: 'es-ES'
+})
+
+const FREE_SERVER_TAGS = new Set([
+  '白嫖中',
+  '白嫖',
+  '免费',
+  '免費',
+  'free',
+  'gratis',
+  'gratuit',
+  '無料'
+])
+
+export function resolveFinanceNumberLocale(lang) {
+  const raw = String(lang || getLanguage?.() || 'en').trim()
+  if (LANGUAGE_TO_BCP47_LOCALE[raw]) return LANGUAGE_TO_BCP47_LOCALE[raw]
+  const lower = raw.toLowerCase()
+  for (const [key, bcp47] of Object.entries(LANGUAGE_TO_BCP47_LOCALE)) {
+    const keyLower = key.toLowerCase()
+    if (lower === keyLower || lower.startsWith(`${keyLower}-`)) {
+      return bcp47
+    }
+  }
+  return 'en-US'
+}
+
+// 与卡片到期日一致：YYYY-MM-DD 按本地日末（次日零点）解析，避免 UTC 零点偏差
+export function parseFinanceExpireTimestamp(value) {
+  const raw = String(value || '').trim()
+  if (!raw) return NaN
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(raw)
+  if (match) {
+    const year = Number(match[1])
+    const month = Number(match[2])
+    const day = Number(match[3])
+    const check = new Date(Date.UTC(year, month - 1, day))
+    if (
+      check.getUTCFullYear() !== year ||
+      check.getUTCMonth() !== month - 1 ||
+      check.getUTCDate() !== day
+    ) {
+      return NaN
+    }
+    return new Date(year, month - 1, day + 1).getTime()
+  }
+  const time = new Date(raw).getTime()
+  return Number.isFinite(time) ? time : NaN
+}
 
 const FINANCE_CURRENCY_CONFIG = Object.freeze({
   AED: { rate: 0.5435, symbol: 'د.إ' },
@@ -223,10 +282,13 @@ export function calculateFinanceSummary(servers, exchangeRates = DEFAULT_EXCHANG
     if (hasFreeTag(server)) continue
 
     const priceCNY = getPriceCNY(server, exchangeRates)
-    if (priceCNY <= 0) continue
+    if (!Number.isFinite(priceCNY) || priceCNY <= 0) continue
 
     summary.configuredCount++
-    summary.monthlyAverageCostCNY += calculateMonthlyAverageCostCNY(server, priceCNY)
+    const monthlyCost = calculateMonthlyAverageCostCNY(server, priceCNY)
+    if (Number.isFinite(monthlyCost) && monthlyCost > 0) {
+      summary.monthlyAverageCostCNY += monthlyCost
+    }
 
     const expireDate = String(server?.expire_date || server?.expired_at || '').trim()
     if (!expireDate) {
@@ -238,9 +300,12 @@ export function calculateFinanceSummary(servers, exchangeRates = DEFAULT_EXCHANG
 
     // 按实际剩余可用时长折算：单价 × (剩余时长 / 计费周期)，总价值与剩余价值同口径
     const termValue = calculateRemainingValueCNY(server, priceCNY, now)
-    summary.totalValueCNY += termValue
-    if (termValue <= 0) summary.expiredCount++
-    summary.remainingValueCNY += termValue
+    if (Number.isFinite(termValue) && termValue > 0) {
+      summary.totalValueCNY += termValue
+      summary.remainingValueCNY += termValue
+    } else {
+      summary.expiredCount++
+    }
   }
 
   return summary
@@ -248,36 +313,45 @@ export function calculateFinanceSummary(servers, exchangeRates = DEFAULT_EXCHANG
 
 function calculateRemainingValueCNY(server, priceCNY, now = Date.now()) {
   const expireDate = String(server?.expire_date || server?.expired_at || '').trim()
-  if (!expireDate || priceCNY <= 0) return 0
+  if (!expireDate || !Number.isFinite(priceCNY) || priceCNY <= 0) return 0
 
-  const expiredAt = new Date(expireDate).getTime()
+  const expiredAt = parseFinanceExpireTimestamp(expireDate)
   if (!Number.isFinite(expiredAt)) return 0
 
-  const diffMs = expiredAt - Number(now)
+  const nowTs = Number(now)
+  if (!Number.isFinite(nowTs)) return 0
+
+  const diffMs = expiredAt - nowTs
   if (diffMs <= 0) return 0
 
   const diffYears = diffMs / (MS_PER_DAY * 365)
   if (diffYears > LONG_TERM_YEARS) return priceCNY
 
   const billingCycleMs = getBillingCycleDays(server) * MS_PER_DAY
-  if (billingCycleMs <= 0) return priceCNY
+  if (!Number.isFinite(billingCycleMs) || billingCycleMs <= 0) return priceCNY
 
-  return priceCNY * (diffMs / billingCycleMs)
+  const val = priceCNY * (diffMs / billingCycleMs)
+  return Number.isFinite(val) && val > 0 ? val : 0
 }
 
 function calculateMonthlyAverageCostCNY(server, priceCNY) {
-  if (priceCNY <= 0) return 0
+  if (!Number.isFinite(priceCNY) || priceCNY <= 0) return 0
   const billingCycleDays = getBillingCycleDays(server)
-  return billingCycleDays > 0 ? priceCNY / billingCycleDays * MONTH_DAYS : 0
+  if (!Number.isFinite(billingCycleDays) || billingCycleDays <= 0) return 0
+  const val = (priceCNY / billingCycleDays) * MONTH_DAYS
+  return Number.isFinite(val) && val > 0 ? val : 0
 }
 
-export function formatFinanceAmount(amount, currency) {
+export function formatFinanceAmount(amount, currency, lang) {
   const code = normalizeFinanceCurrency(currency)
-  const safeAmount = Number.isFinite(Number(amount)) ? Number(amount) : 0
-  const value = new Intl.NumberFormat('zh-CN', {
+  const numericAmount = Number(amount)
+  const safeAmount = Number.isFinite(numericAmount) ? numericAmount : 0
+  const locale = resolveFinanceNumberLocale(lang)
+  const absAmount = Math.abs(safeAmount)
+  const value = new Intl.NumberFormat(locale, {
     maximumFractionDigits: 2,
-    minimumFractionDigits: Math.abs(safeAmount) < 100000 ? 2 : 0,
-    notation: Math.abs(safeAmount) >= 100000 ? 'compact' : 'standard'
+    minimumFractionDigits: absAmount < 100000 ? 2 : 0,
+    notation: absAmount >= 100000 ? 'compact' : 'standard'
   }).format(safeAmount)
 
   return {
@@ -289,8 +363,14 @@ export function formatFinanceAmount(amount, currency) {
 
 export function convertCnyAmount(amountCNY, currency, exchangeRates = DEFAULT_EXCHANGE_RATES) {
   const code = normalizeFinanceCurrency(currency)
-  const rate = exchangeRates[code] || DEFAULT_EXCHANGE_RATES[code] || 1
-  return Number(amountCNY || 0) * rate
+  const baseAmount = Number(amountCNY)
+  if (!Number.isFinite(baseAmount)) return 0
+  const candidateRate = Number(exchangeRates?.[code] ?? DEFAULT_EXCHANGE_RATES[code] ?? 1)
+  const rate = Number.isFinite(candidateRate) && candidateRate > 0
+    ? candidateRate
+    : (DEFAULT_EXCHANGE_RATES[code] || 1)
+  const converted = baseAmount * rate
+  return Number.isFinite(converted) ? converted : 0
 }
 
 function getPriceCNY(server, exchangeRates) {
@@ -303,8 +383,10 @@ function getPriceCNY(server, exchangeRates) {
   const currency = normalizeServerCurrency(server)
   if (currency === 'CNY') return price
 
-  const rate = exchangeRates[currency] || DEFAULT_EXCHANGE_RATES[currency] || 0
-  return rate > 0 ? price / rate : 0
+  const candidateRate = Number(exchangeRates?.[currency] ?? DEFAULT_EXCHANGE_RATES[currency] ?? 0)
+  if (!Number.isFinite(candidateRate) || candidateRate <= 0) return 0
+  const cny = price / candidateRate
+  return Number.isFinite(cny) && cny > 0 ? cny : 0
 }
 
 function normalizeServerCurrency(server) {
@@ -321,9 +403,9 @@ function getBillingCycleDays(server) {
 function hasFreeTag(server) {
   const tags = String(server?.tags || '')
     .split(',')
-    .map(tag => tag.trim())
+    .map(tag => tag.trim().toLowerCase())
     .filter(Boolean)
-  return tags.includes('白嫖中')
+  return tags.some(tag => FREE_SERVER_TAGS.has(tag))
 }
 
 async function fetchExchangeRates() {
@@ -345,12 +427,12 @@ async function fetchExchangeRates() {
 
 async function fetchWithTimeout(url, timeoutMs = 5000) {
   const controller = new AbortController()
-  const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs)
+  const timeoutId = globalThis.setTimeout(() => controller.abort(), timeoutMs)
 
   try {
     return await fetch(url, { signal: controller.signal })
   } finally {
-    window.clearTimeout(timeoutId)
+    globalThis.clearTimeout(timeoutId)
   }
 }
 
@@ -399,17 +481,9 @@ function getTodayDateKey(date = new Date()) {
 }
 
 function getLocalStorageItem(key) {
-  try {
-    return localStorage.getItem(key)
-  } catch (_) {
-    return null
-  }
+  return safeLocalStorage.getItem(key)
 }
 
 function setLocalStorageItem(key, value) {
-  try {
-    localStorage.setItem(key, value)
-  } catch (_) {
-    // 汇率缓存失败不影响前端统计，下一次刷新会重新请求或使用内置汇率。
-  }
+  safeLocalStorage.setItem(key, value)
 }

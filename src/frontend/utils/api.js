@@ -5,6 +5,8 @@ import { ref } from 'vue'
 import { normalizeTimestamp } from './time.js'
 import { TIME } from './constants'
 import { resolveDisplayMode } from './displayMode.js'
+import { resolveCustomPingNodeName } from './server.js'
+import { safeLocalStorage } from './storage.js'
 
 export const VERSION = ref('')
 export const LAST_WORKERS_VERSION = ref('')
@@ -48,11 +50,7 @@ export const createLiveSocket = (subscribe, handlers = {}, apiIndex = 0, serverI
   }
 
   const getJwtToken = () => {
-    try {
-      return localStorage.getItem(STORAGE.JWT_TOKEN) || ''
-    } catch (_) {
-      return ''
-    }
+    return safeLocalStorage.getItem(STORAGE.JWT_TOKEN) || ''
   }
 
   const isSameHostWebSocket = (url) => {
@@ -143,7 +141,7 @@ export const createLiveSocket = (subscribe, handlers = {}, apiIndex = 0, serverI
   }
 
   const connect = () => {
-    manualClose = false
+    if (manualClose) return
     let socket = null
     try {
       const url = new URL(`${getWsBaseByIndex(apiIndex)}/api/ws`)
@@ -226,13 +224,14 @@ export const createLiveSocket = (subscribe, handlers = {}, apiIndex = 0, serverI
       return
     }
 
+    const delay = reconnectDelay
+    reconnectAttempts++
+    reconnectDelay = Math.min(reconnectDelay * 2, TIME.RECONNECT_MAX_DELAY_MS)
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null
-      reconnectAttempts++
-      const delay = reconnectDelay
-      reconnectDelay = Math.min(reconnectDelay * 2, TIME.RECONNECT_MAX_DELAY_MS)
-      setTimeout(connect, delay)
-    }, 50)
+      if (manualClose) return
+      connect()
+    }, delay)
   }
 
   connect()
@@ -250,6 +249,7 @@ export const createLiveSocket = (subscribe, handlers = {}, apiIndex = 0, serverI
     reconnect() {
       manualClose = false
       reconnectAttempts = 0
+      reconnectDelay = TIME.RECONNECT_INITIAL_DELAY_MS
       clearReplayTimers()
       clearConnectionLifetimeTimer()
       if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
@@ -264,19 +264,69 @@ export const createLiveSocket = (subscribe, handlers = {}, apiIndex = 0, serverI
 }
 
 export const getFlagRegionCode = (region) => {
-  const code = (region || '').toUpperCase()
-  if (code === 'TW') return 'cn'
-  return code.toLowerCase()
+  const code = String(region ?? '').trim()
+  if (!/^[a-z]{2}$/i.test(code)) return ''
+  const upper = code.toUpperCase()
+  if (upper === 'TW') return 'cn'
+  return upper.toLowerCase()
+}
+
+const BYTE_UNITS = Object.freeze(['B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB'])
+const MAX_YB_VALUE = 9999
+export const MAX_DISPLAYABLE_BYTES = MAX_YB_VALUE * Math.pow(1024, BYTE_UNITS.length - 1)
+const OVERFLOW_SENTINEL_BYTES = MAX_DISPLAYABLE_BYTES * 2
+
+export const gbToBytes = (gb) => {
+  if (gb === null || gb === undefined || typeof gb === 'boolean') return 0
+  if (typeof gb === 'string' && gb.trim() === '') return 0
+  const num = Number(gb)
+  if (!Number.isFinite(num) || num <= 0) return 0
+  const maxSafeGb = MAX_DISPLAYABLE_BYTES / (1024 * 1024 * 1024)
+  if (num > maxSafeGb) return OVERFLOW_SENTINEL_BYTES
+  return num * 1024 * 1024 * 1024
+}
+
+export const mibToBytes = (mib) => {
+  if (mib === null || mib === undefined || typeof mib === 'boolean') return 0
+  if (typeof mib === 'string' && mib.trim() === '') return 0
+  const num = Number(mib)
+  if (!Number.isFinite(num) || num <= 0) return 0
+  const maxSafeMib = MAX_DISPLAYABLE_BYTES / (1024 * 1024)
+  if (num > maxSafeMib) return OVERFLOW_SENTINEL_BYTES
+  return num * 1024 * 1024
 }
 
 export const formatBytes = (bytes) => {
-  bytes = parseFloat(bytes) || 0
-  if (bytes === 0) return '0 B'
+  if (bytes === null || bytes === undefined || typeof bytes === 'boolean') return '0 B'
+  if (typeof bytes === 'string' && bytes.trim() === '') return '0 B'
+  const numericBytes = Number(bytes)
+  // 负值（如流量修正瞬间导致的月流量负数）与非有限值会让 Math.log 产生 NaN，
+  // 渲染成 "NaN undefined"，这里统一按 0 B 处理
+  if (!Number.isFinite(numericBytes) || numericBytes <= 0) return '0 B'
+  if (numericBytes > MAX_DISPLAYABLE_BYTES) return '>9999 YB'
+
   const k = 1024
-  const sizes = ['B', 'KB', 'MB', 'GB', 'TB']
-  const i = Math.floor(Math.log(bytes) / Math.log(k))
-  const safeIndex = Math.max(0, Math.min(i, sizes.length - 1))
-  return parseFloat((bytes / Math.pow(k, safeIndex)).toFixed(1)) + ' ' + sizes[safeIndex]
+  const rawIndex = Math.floor(Math.log(numericBytes) / Math.log(k))
+  let unitIndex = Math.max(0, Math.min(rawIndex, BYTE_UNITS.length - 1))
+
+  let scaled = numericBytes / Math.pow(k, unitIndex)
+  let rounded = Number(scaled.toFixed(1))
+
+  if (rounded >= k && unitIndex < BYTE_UNITS.length - 1) {
+    unitIndex += 1
+    scaled = numericBytes / Math.pow(k, unitIndex)
+    rounded = Number(scaled.toFixed(1))
+  }
+
+  if (unitIndex === BYTE_UNITS.length - 1 && rounded > MAX_YB_VALUE) {
+    return '>9999 YB'
+  }
+
+  if (unitIndex === 0) {
+    return `${Number.isInteger(rounded) ? rounded : rounded.toFixed(1)} B`
+  }
+
+  return `${scaled.toFixed(1)} ${BYTE_UNITS[unitIndex]}`
 }
 
 export const isServerOnline = (server, now = Date.now()) => {
@@ -318,6 +368,16 @@ const createEmptyMergedData = () => ({
   }
 })
 
+const mergePingNodeName = (prevValue, nextValue, fieldKey) => {
+  const prevCustom = resolveCustomPingNodeName(fieldKey, prevValue)
+  const nextCustom = resolveCustomPingNodeName(fieldKey, nextValue)
+  // 前序站点已有自定义名称时保留前序自定义名，避免次站点未修改的内置默认名覆盖自定义名；
+  // 前序仍为内置默认/空串时，采纳后续站点的自定义名。
+  if (prevCustom) return prevCustom
+  if (nextCustom) return nextCustom
+  return nextValue ?? prevValue
+}
+
 const mergeSiteResult = (mergedData, { data, error, baseUrl }, multiSite, localTitle) => {
   if (error || !data) return
 
@@ -336,27 +396,36 @@ const mergeSiteResult = (mergedData, { data, error, baseUrl }, multiSite, localT
   }
 
   if (data.stats) {
-    mergedData.stats.total += data.stats.total || 0
-    mergedData.stats.online += data.stats.online || 0
-    mergedData.stats.offline += data.stats.offline || 0
-    mergedData.stats.globalNetRx += data.stats.globalNetRx || 0
-    mergedData.stats.globalNetTx += data.stats.globalNetTx || 0
-    mergedData.stats.globalSpeedIn += data.stats.globalSpeedIn || 0
-    mergedData.stats.globalSpeedOut += data.stats.globalSpeedOut || 0
+    mergedData.stats.total += Number(data.stats.total) || 0
+    mergedData.stats.online += Number(data.stats.online) || 0
+    mergedData.stats.offline += Number(data.stats.offline) || 0
+    mergedData.stats.globalNetRx += Number(data.stats.globalNetRx) || 0
+    mergedData.stats.globalNetTx += Number(data.stats.globalNetTx) || 0
+    mergedData.stats.globalSpeedIn += Number(data.stats.globalSpeedIn) || 0
+    mergedData.stats.globalSpeedOut += Number(data.stats.globalSpeedOut) || 0
   }
 
   if (data.regionStats) {
     for (const code in data.regionStats) {
-      mergedData.regionStats[code] = (mergedData.regionStats[code] || 0) + data.regionStats[code]
+      mergedData.regionStats[code] = (Number(mergedData.regionStats[code]) || 0) + (Number(data.regionStats[code]) || 0)
     }
   }
 
   if (data.sysConfig) {
     mergedData.sysConfig = {
+      ...mergedData.sysConfig,
       show_price: data.sysConfig.show_price ?? mergedData.sysConfig.show_price,
       show_expire: data.sysConfig.show_expire ?? mergedData.sysConfig.show_expire,
       show_tf: data.sysConfig.show_tf ?? mergedData.sysConfig.show_tf,
       show_three_net_details: data.sysConfig.show_three_net_details ?? mergedData.sysConfig.show_three_net_details,
+      custom_ct_name: mergePingNodeName(mergedData.sysConfig.custom_ct_name, data.sysConfig.custom_ct_name, 'custom_ct_name'),
+      custom_cu_name: mergePingNodeName(mergedData.sysConfig.custom_cu_name, data.sysConfig.custom_cu_name, 'custom_cu_name'),
+      custom_cm_name: mergePingNodeName(mergedData.sysConfig.custom_cm_name, data.sysConfig.custom_cm_name, 'custom_cm_name'),
+      custom_bd_name: mergePingNodeName(mergedData.sysConfig.custom_bd_name, data.sysConfig.custom_bd_name, 'custom_bd_name'),
+      node_1_name: mergePingNodeName(mergedData.sysConfig.node_1_name, data.sysConfig.node_1_name, 'node_1_name'),
+      node_2_name: mergePingNodeName(mergedData.sysConfig.node_2_name, data.sysConfig.node_2_name, 'node_2_name'),
+      node_3_name: mergePingNodeName(mergedData.sysConfig.node_3_name, data.sysConfig.node_3_name, 'node_3_name'),
+      node_4_name: mergePingNodeName(mergedData.sysConfig.node_4_name, data.sysConfig.node_4_name, 'node_4_name'),
       display_mode: resolveDisplayMode(data.sysConfig, mergedData.sysConfig.display_mode),
       site_title: multiSite ? localTitle : mergedData.sysConfig.site_title,
       latency_window: data.sysConfig.latency_window ?? mergedData.sysConfig.latency_window
@@ -383,13 +452,16 @@ export const fetchServersAllWithProgress = async (onResult) => {
 }
 
 export const fetchServerDetail = async (id, apiIndex = 0) => {
-  const result = await http.getByIndex(`/api/server?id=${id}`, apiIndex)
+  const encodedId = encodeURIComponent(String(id ?? ''))
+  const result = await http.getByIndex(`/api/server?id=${encodedId}`, apiIndex)
   if (result.error) return null
   return result.data
 }
 
 export const fetchAllHistory = async (id, hours, apiIndex = 0) => {
-  const result = await http.getByIndex(`/api/history/all?id=${id}&hours=${hours}`, apiIndex, { autoRedirect: false })
+  const encodedId = encodeURIComponent(String(id ?? ''))
+  const encodedHours = encodeURIComponent(String(hours ?? ''))
+  const result = await http.getByIndex(`/api/history/all?id=${encodedId}&hours=${encodedHours}`, apiIndex, { autoRedirect: false })
   if (result.error) {
     const error = new Error(result.error)
     error.code = result.code
@@ -407,18 +479,18 @@ export const adminApi = async (data, apiIndex = 0) => {
 
 export const login = async (username, password, turnstileToken = '', apiIndex = 0) => {
   if (turnstileToken) {
-    localStorage.setItem(STORAGE.TURNSTILE_TOKEN, turnstileToken)
+    safeLocalStorage.setItem(STORAGE.TURNSTILE_TOKEN, turnstileToken)
   }
   const result = await http.postByIndex('/admin/api', { action: 'login', username, password }, apiIndex, { autoRedirect: false })
   
   if (!result.error && result.data && result.data.token) {
-    localStorage.setItem(STORAGE.JWT_TOKEN, result.data.token)
+    safeLocalStorage.setItem(STORAGE.JWT_TOKEN, result.data.token)
   }
   return result
 }
 
 export const logout = () => {
-  localStorage.removeItem(STORAGE.JWT_TOKEN)
+  safeLocalStorage.removeItem(STORAGE.JWT_TOKEN)
 }
 
 export const fetchConfig = async (apiIndex = 0) => {

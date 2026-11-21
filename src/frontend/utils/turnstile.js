@@ -1,5 +1,6 @@
 import { http, DEFAULT_REQUEST_TIMEOUT_MS } from './http'
 import { STORAGE } from './constants'
+import { safeLocalStorage } from './storage.js'
 
 const TURNSTILE_SCRIPT_SRC = 'https://challenges.cloudflare.com/turnstile/v0/api.js'
 const TURNSTILE_TOKEN_KEY = STORAGE.TURNSTILE_TOKEN
@@ -13,17 +14,17 @@ const normalizeTurnstileSiteKey = (value) => String(value || '').trim()
 
 export const setTurnstileToken = (token) => {
   if (token) {
-    localStorage.setItem(TURNSTILE_TOKEN_KEY, token)
+    safeLocalStorage.setItem(TURNSTILE_TOKEN_KEY, token)
   }
 }
 
-export const getTurnstileToken = () => localStorage.getItem(TURNSTILE_TOKEN_KEY) || ''
+export const getTurnstileToken = () => safeLocalStorage.getItem(TURNSTILE_TOKEN_KEY) || ''
 
 export const clearTurnstileToken = () => {
-  localStorage.removeItem(TURNSTILE_TOKEN_KEY)
+  safeLocalStorage.removeItem(TURNSTILE_TOKEN_KEY)
 }
 
-export const hasSharedTurnstileVerified = () => !!localStorage.getItem(TURNSTILE_VERIFIED_KEY)
+export const hasSharedTurnstileVerified = () => !!safeLocalStorage.getItem(TURNSTILE_VERIFIED_KEY)
 
 export const getTurnstileEnabledSites = (results, mode = 'global') => {
   return results
@@ -51,8 +52,8 @@ export const hasTurnstileSiteKeyMismatch = (sites) => {
 export const fetchAllTurnstileConfigs = async () => {
   let results = await http.getAll('/api/config', { includeAuth: true, includeTurnstile: true, autoRedirect: false, timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS })
   if (results.some(r => r.status === 403 || r.timeout)) {
-    localStorage.removeItem(STORAGE.TURNSTILE_TOKEN)
-    localStorage.removeItem(STORAGE.TURNSTILE_VERIFIED)
+    safeLocalStorage.removeItem(STORAGE.TURNSTILE_TOKEN)
+    safeLocalStorage.removeItem(STORAGE.TURNSTILE_VERIFIED)
     results = await http.getAll('/api/config', { includeAuth: true, includeTurnstile: false, includeTurnstileVerified: false, autoRedirect: false, timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS })
   }
   return results

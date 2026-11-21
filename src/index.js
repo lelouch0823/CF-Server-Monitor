@@ -8,10 +8,10 @@ import { handleServerAPI, handleServersAPI } from './handlers/dashboard.js';
 import { handleTheme } from './handlers/theme.js';
 import { isValidThemeOptions, loadSettings, loadSiteSettings, loadAppearanceOptions, normalizeFrontendWsTimeoutMinutes, normalizeLongHistoryPoints, saveThemeOptions, setDebug, debug } from './utils/settings.js';
 import { omitNullLossProbeFields } from './handlers/dashboard.js';
-import { checkAuth, simpleAuthResponse } from './middleware/auth.js';
+import { checkAuth, checkWebSocketAuth, simpleAuthResponse } from './middleware/auth.js';
 import { getServerDetail, getMetricsHistoryCache, setMetricsHistoryCache, getCacheDuration } from './utils/cache.js';
 import { AppError, createSuccessResponse, createUnauthorizedResponse, createBadRequestResponse, createNotFoundResponse, createErrorResponse } from './utils/errors.js';
-import { verifyTurnstileToken } from './utils/common.js';
+import { verifyTurnstileToken, timingSafeEqualString } from './utils/common.js';
 import { getCorsAllowedOrigins, createOptionsResponse, applyCors } from './utils/cors.js';
 import { getRemoteVersion } from './utils/version.js';
 import {
@@ -39,8 +39,36 @@ function cleanThemeAssetResponse(response) {
   });
 }
 
+const TURNSTILE_VERIFIED_COOKIE = 'turnstile_verified';
+
+function getRequestCookieValue(request, name) {
+  const cookieHeader = request?.headers?.get('Cookie') || '';
+  const prefix = `${name}=`;
+  for (const part of cookieHeader.split(';')) {
+    const item = part.trim();
+    if (!item.startsWith(prefix)) continue;
+    try {
+      return decodeURIComponent(item.slice(prefix.length));
+    } catch (_) {
+      return item.slice(prefix.length);
+    }
+  }
+  return '';
+}
+
+function buildTurnstileVerifiedCookie(request, value, maxAge = 3600) {
+  const secure = new URL(request.url).protocol === 'https:' ? '; Secure' : '';
+  return `${TURNSTILE_VERIFIED_COOKIE}=${encodeURIComponent(value || '')}; Max-Age=${maxAge}; Path=/; HttpOnly; SameSite=Lax${secure}`;
+}
+
 async function getEncryptionKey(env, sys) {
-  let secret = (sys && sys.jwt_secret) || env.TURNSTILE_SECRET_KEY || env.API_SECRET || 'default_secret_key_for_turnstile_encryption';
+  if (sys?._degradedColdFailure === true) {
+    throw new Error('Turnstile encryption unavailable during degraded cold failure');
+  }
+  let secret = (sys && sys.jwt_secret) || env.TURNSTILE_SECRET_KEY || env.API_SECRET;
+  if (!secret) {
+    throw new Error('Missing secret key for Turnstile encryption');
+  }
   secret += '_turnstile';
   const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(secret));
   const keyMaterial = await crypto.subtle.importKey(
@@ -89,16 +117,35 @@ async function decryptTurnstileData(encoded, env, sys) {
 }
 
 async function isTurnstileVerified(request, env, sys) {
+  const candidates = [];
   const verifiedHeader = request.headers.get('X-Turnstile-Verified');
-  
-  if (!verifiedHeader) return false;
-  
-  try {
-    const decrypted = await decryptTurnstileData(verifiedHeader, env, sys);
-    return decrypted && decrypted.expires && Date.now() < decrypted.expires * 1000;
-  } catch {
-    return false;
+  if (verifiedHeader) {
+    candidates.push(verifiedHeader);
   }
+  const verifiedCookie = getRequestCookieValue(request, TURNSTILE_VERIFIED_COOKIE);
+  if (verifiedCookie) {
+    candidates.push(verifiedCookie);
+  }
+  try {
+    const reqUrl = new URL(request.url);
+    if (reqUrl.pathname === '/api/ws') {
+      const queryVerified = reqUrl.searchParams.get(TURNSTILE_VERIFIED_COOKIE);
+      if (queryVerified) {
+        candidates.push(queryVerified);
+      }
+    }
+  } catch (_) {}
+
+  for (const encoded of candidates) {
+    try {
+      const decrypted = await decryptTurnstileData(encoded, env, sys);
+      if (decrypted && decrypted.expires && Date.now() < decrypted.expires * 1000) {
+        return true;
+      }
+    } catch (_) {}
+  }
+
+  return false;
 }
 
 async function fetchHistoryData(env, request, id, hours, columns, sys = null) {
@@ -200,6 +247,15 @@ export default {
       return createOptionsResponse(request, corsAllowedOrigins);
     }
 
+    if ((method === 'GET' || method === 'HEAD') && path.toLowerCase() === '/dashboard.html') {
+      const target = new URL(request.url);
+      target.pathname = '/';
+      return applyCors(new Response(null, {
+        status: 302,
+        headers: { Location: target.toString() }
+      }), request, corsAllowedOrigins);
+    }
+
     if (method === 'GET' && path === '/admin/') {
       const target = new URL(request.url);
       const search = target.search;
@@ -211,18 +267,16 @@ export default {
     }
 
     if (method === 'GET' && path.startsWith('/assets/')) {
-      try {
-        const themeAssetResponse = await serveFrontend(request, env, await loadSettings(env.DB));
-        if (themeAssetResponse.headers.get('X-CFSM-Theme-Asset') === '1') {
-          return applyCors(cleanThemeAssetResponse(themeAssetResponse), request, corsAllowedOrigins);
-        }
-      } catch (e) {
-      }
+      const assetSettings = await loadSettings(env.DB);
+      const themeAssetResponse = await serveFrontend(request, env, assetSettings);
+      const finalAssetResponse = themeAssetResponse.headers.get('X-CFSM-Theme-Asset') === '1'
+        ? cleanThemeAssetResponse(themeAssetResponse)
+        : themeAssetResponse;
+      return applyCors(finalAssetResponse, request, corsAllowedOrigins);
     }
 
     const bypassTurnstilePaths = [
       '/admin/api',
-      '/api/ws',
     ];
 
     const isApiRequest = path.startsWith('/api/') || path.startsWith('/admin/api');
@@ -239,6 +293,7 @@ export default {
     };
 
     let setTurnstileVerified = false;
+    let turnstileVerifiedToken = null;
     let sys = null;
 
     if (isApiRequest && !isTurnstileBypassed(path)) {
@@ -246,13 +301,15 @@ export default {
       const turnstileEnabled = sys.turnstile_enabled === 'true';
       const turnstileSecretKey = sys.turnstile_secret_key || '';
       
-      // 全局 Turnstile 验证：仅 turnstile_enabled 开启时拦截所有 API 请求
+      // 全局 Turnstile 验证：仅 turnstile_enabled 开启时拦截所有 API（含 /api/ws）请求
       // turnstile_login_enabled 仅在登录时验证，不在此处拦截
       if (turnstileEnabled) {
-        const hasValidCookie = await isTurnstileVerified(request, env, sys);
+        const isAuthenticatedWs = path === '/api/ws' && await checkWebSocketAuth(request, env, sys);
+        const hasValidCookie = isAuthenticatedWs || await isTurnstileVerified(request, env, sys);
         
         if (!hasValidCookie) {
-          const turnstileToken = request.headers.get('X-Turnstile-Token');
+          const turnstileToken = request.headers.get('X-Turnstile-Token') ||
+            (path === '/api/ws' ? url.searchParams.get('turnstile_token') : null);
           const isVerified = await verifyTurnstileToken(turnstileToken, turnstileSecretKey);
           
           if (!isVerified) {
@@ -261,6 +318,9 @@ export default {
           }
           
           setTurnstileVerified = true;
+          const expires = Math.floor(Date.now() / 1000) + 3600;
+          const cookieData = { expires, verified: true, timestamp: Date.now() };
+          turnstileVerifiedToken = await encryptTurnstileData(cookieData, env, sys);
         }
       }
     }
@@ -279,8 +339,28 @@ export default {
 
     const routes = [
       { method: 'POST', path: '/update', handler: () => handleUpdate(request, env, ctx) },
-      { method: 'GET', path: '/update', handler: () => handleUpdateWebSocketUpgrade(request, env) },
+      { method: 'GET', path: '/update', handler: async () => {
+        const authHeader = request.headers.get('Authorization');
+        const agentSecretHeader = request.headers.get('X-Agent-Secret');
+        if (authHeader !== null || agentSecretHeader !== null) {
+          let providedSecret = '';
+          if (agentSecretHeader !== null) {
+            providedSecret = agentSecretHeader.trim();
+          } else if (authHeader !== null) {
+            const match = authHeader.trim().match(/^Bearer\s+(.+)$/i);
+            providedSecret = match ? match[1].trim() : '';
+          }
+          if (!providedSecret || !timingSafeEqualString(providedSecret, env.API_SECRET)) {
+            return createUnauthorizedResponse('Invalid secret');
+          }
+        }
+        return handleUpdateWebSocketUpgrade(request, env);
+      }},
       { method: 'GET', path: '/__do/health', handler: async () => {
+        await ensureSiteSettings();
+        if (!await checkAuth(request, env, sys)) {
+          return applyCors(simpleAuthResponse(), request, env);
+        }
         if (!env.METRICS_BROADCASTER) {
           return createSuccessResponse({ ok: false, reason: 'DO not bound' });
         }
@@ -289,7 +369,8 @@ export default {
           const stub = env.METRICS_BROADCASTER.get(id);
           return await stub.fetch('http://internal/health');
         } catch (e) {
-          return createSuccessResponse({ ok: false, reason: e.message });
+          console.error('[DO] health check error:', e);
+          return createSuccessResponse({ ok: false, reason: 'Health check unavailable' });
         }
       }},
       { method: 'GET', path: '/api/config', handler: async () => {
@@ -304,9 +385,12 @@ export default {
           verified = await isTurnstileVerified(request, env, sys);
           if (setTurnstileVerified) {
             verified = true;
-            const expires = Math.floor(Date.now() / 1000) + 3600;
-            const cookieData = { expires, verified: true, timestamp: Date.now() };
-            turnstileVerified = await encryptTurnstileData(cookieData, env, sys);
+            if (!turnstileVerifiedToken) {
+              const expires = Math.floor(Date.now() / 1000) + 3600;
+              const cookieData = { expires, verified: true, timestamp: Date.now() };
+              turnstileVerifiedToken = await encryptTurnstileData(cookieData, env, sys);
+            }
+            turnstileVerified = turnstileVerifiedToken;
           }
         }
 
@@ -440,10 +524,18 @@ export default {
         }
 
         if (setTurnstileVerified) {
+          // Turnstile 验证通过后允许任意前端源读取公开数据，
+          // 但不携带 Allow-Credentials：凭据 cookie 为 SameSite=Lax，
+          // 跨站请求本就不携带，凭据型跨源读取必须走 CORS 白名单（applyCors）。
           const finalHeaders = new Headers(response.headers);
-          finalHeaders.set('Access-Control-Allow-Origin', request.headers.get('Origin') || '');
-          finalHeaders.set('Access-Control-Allow-Credentials', 'true');
-          finalHeaders.set('Vary', 'Origin');
+          const originHeader = request.headers.get('Origin');
+          if (originHeader) {
+            finalHeaders.set('Access-Control-Allow-Origin', originHeader);
+            finalHeaders.set('Vary', 'Origin');
+          }
+          if (turnstileVerifiedToken) {
+            finalHeaders.append('Set-Cookie', buildTurnstileVerifiedCookie(request, turnstileVerifiedToken));
+          }
 
           return new Response(response.body, {
             status: response.status,

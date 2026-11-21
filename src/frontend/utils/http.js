@@ -1,5 +1,6 @@
 import { getApiBases } from './config'
 import { STORAGE } from './constants'
+import { safeLocalStorage } from './storage.js'
 
 const DEFAULT_ERROR_MESSAGES = {
   401: 'Unauthorized',
@@ -40,21 +41,21 @@ const createHeaders = (includeAuth = true, includeTurnstile = true, baseUrl = nu
   }
   
   if (includeAuth) {
-    const token = localStorage.getItem(STORAGE.JWT_TOKEN)
+    const token = safeLocalStorage.getItem(STORAGE.JWT_TOKEN)
     if (token) {
       headers['Authorization'] = 'Bearer ' + token
     }
   }
   
   if (includeTurnstile && includeTurnstileToken) {
-    const turnstileToken = localStorage.getItem(STORAGE.TURNSTILE_TOKEN)
+    const turnstileToken = safeLocalStorage.getItem(STORAGE.TURNSTILE_TOKEN)
     if (turnstileToken) {
       headers['X-Turnstile-Token'] = turnstileToken
     }
   }
 
   if (includeTurnstileVerified) {
-    const turnstileVerified = localStorage.getItem(TURNSTILE_VERIFIED_KEY)
+    const turnstileVerified = safeLocalStorage.getItem(TURNSTILE_VERIFIED_KEY)
     if (turnstileVerified) {
       headers['X-Turnstile-Verified'] = turnstileVerified
     }
@@ -67,7 +68,7 @@ const handleResponse = async (res, options = {}) => {
   const { autoRedirect = true, baseUrl = null } = options
   
   if (res.status === 401) {
-    localStorage.removeItem(STORAGE.JWT_TOKEN)
+    safeLocalStorage.removeItem(STORAGE.JWT_TOKEN)
     if (autoRedirect) {
       redirectToAdminLogin()
     }
@@ -75,9 +76,9 @@ const handleResponse = async (res, options = {}) => {
   }
   
   if (res.status === 403) {
-    localStorage.removeItem(STORAGE.TURNSTILE_TOKEN)
-    localStorage.removeItem(TURNSTILE_VERIFIED_KEY)
-    if (autoRedirect) {
+    safeLocalStorage.removeItem(STORAGE.TURNSTILE_TOKEN)
+    safeLocalStorage.removeItem(TURNSTILE_VERIFIED_KEY)
+    if (autoRedirect && typeof window !== 'undefined') {
       window.location.reload()
     }
     return { error: DEFAULT_ERROR_MESSAGES[403], status: 403 }
@@ -110,8 +111,8 @@ const handleResponse = async (res, options = {}) => {
   try {
     const data = await res.json()
     if (data && data.turnstile_verified) {
-      localStorage.setItem(TURNSTILE_VERIFIED_KEY, data.turnstile_verified)
-      localStorage.removeItem(STORAGE.TURNSTILE_TOKEN)
+      safeLocalStorage.setItem(TURNSTILE_VERIFIED_KEY, data.turnstile_verified)
+      safeLocalStorage.removeItem(STORAGE.TURNSTILE_TOKEN)
     }
     return { data, status: res.status }
   } catch (e) {
@@ -240,7 +241,7 @@ export const http = {
     )
 
     const settled = await Promise.allSettled(promises)
-    return settled.map(r => r.status === 'fulfilled' ? r.value : { error: r.reason?.message || 'Request failed', status: 0, baseUrl: '' })
+    return settled.map((r, i) => r.status === 'fulfilled' ? r.value : { error: r.reason?.message || 'Request failed', status: 0, baseUrl: bases[i] })
   },
 
   getByIndex(url, index = 0, options = {}) {
@@ -257,7 +258,7 @@ export const http = {
 }
 
 export const isAdminLoggedIn = () => {
-  return !!localStorage.getItem(STORAGE.JWT_TOKEN)
+  return !!safeLocalStorage.getItem(STORAGE.JWT_TOKEN)
 }
 
 export default http

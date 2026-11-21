@@ -1,7 +1,22 @@
 import { getAllServers, getLatestMetricsCache, setLatestMetricsCache, getMetricsHistoryCache, setMetricsHistoryCache, getCacheDuration, clearAllCaches } from '../utils/cache.js';
 import { saveSiteOptions, debug, normalizeLongHistoryPoints, DEFAULT_LONG_HISTORY_POINTS } from '../utils/settings.js';
-import { attachDiskMetricsObject, flattenDiskMetrics, isDisabledProbeMetric, normalizeProbeMetricRow } from '../utils/metrics.js';
-import { ensureServerOptimization, buildHistoryId, getServerHistoryInfo, getHistoryIdRange } from './indexOptimization.js';
+import {
+  attachDiskMetricsObject,
+  flattenDiskMetrics,
+  isDisabledProbeMetric,
+  normalizeProbeMetricRow,
+  sanitizeGpuInfo,
+  toSafeMetricFloat,
+  toSafeMetricInt,
+  toSafeMetricString
+} from '../utils/metrics.js';
+import {
+  ensureServerOptimization,
+  buildHistoryId,
+  getServerHistoryInfo,
+  getHistoryIdRange,
+  SERVERS_HISTORY_PARTITION_UNIQUE_INDEX_SQL
+} from './indexOptimization.js';
 import { addHistoryColumns } from './updateDatabase.js';
 import {
   buildSparseHistoryQuery,
@@ -9,7 +24,8 @@ import {
 } from './historySampling.js';
 import {
   createHistoryTableSql,
-  HISTORY_INSERT_COLUMNS
+  HISTORY_INSERT_COLUMNS,
+  HISTORY_TABLE_COLUMNS
 } from '../utils/historyFields.js';
 import {
   DASHBOARD_LATENCY_WINDOW_CACHE_MAX_SERVERS,
@@ -19,10 +35,65 @@ import {
   DASHBOARD_LATENCY_WINDOW_QUERY_CONCURRENCY
 } from '../utils/config.js';
 
-let dbInitialized = false;
+const initializedDbs = new WeakSet();
+let fallbackDbInitialized = false;
+
+function isDbInitialized(db) {
+  if (db && typeof db === 'object') return initializedDbs.has(db);
+  return fallbackDbInitialized;
+}
+
+function setDbInitialized(db, value) {
+  if (db && typeof db === 'object') {
+    if (value) initializedDbs.add(db);
+    else initializedDbs.delete(db);
+  } else {
+    fallbackDbInitialized = Boolean(value);
+  }
+}
 
 const LOSS_AGG_COLUMNS = new Set(['loss_ct', 'loss_cu', 'loss_cm', 'loss_bd', 'loss_node_1', 'loss_node_2', 'loss_node_3', 'loss_node_4']);
+const VALID_HISTORY_COLUMN_SET = new Set(HISTORY_TABLE_COLUMNS.map(([name]) => name));
 const DEFAULT_HISTORY_MAX_POINTS = 160;
+const MIN_VALID_METRIC_TIMESTAMP_MS = Date.UTC(2000, 0, 1);
+const MAX_FUTURE_METRIC_DRIFT_MS = 120 * 1000;
+const MAX_PING_LATENCY_MS = 600000;
+
+export function clampMetricTimestamp(value, serverNow = Date.now()) {
+  const raw = Number(value);
+  if (!Number.isFinite(raw) || raw <= 0) return serverNow;
+  const ms = raw < 10000000000 ? raw * 1000 : raw;
+  if (ms < MIN_VALID_METRIC_TIMESTAMP_MS || ms > serverNow + MAX_FUTURE_METRIC_DRIFT_MS) {
+    return serverNow;
+  }
+  return Math.trunc(ms);
+}
+
+function parseValidatedHistoryColumns(columns) {
+  const list = String(columns || '')
+    .split(',')
+    .map(c => c.trim())
+    .filter(c => c && c !== 'timestamp');
+  if (list.length === 0) {
+    throw new Error('Missing history columns');
+  }
+  for (const col of list) {
+    if (!VALID_HISTORY_COLUMN_SET.has(col) || col === 'id') {
+      throw new Error(`Invalid history column: ${col}`);
+    }
+  }
+  return list;
+}
+
+function safeParseJsonRow(rawJson) {
+  if (!rawJson) return null;
+  try {
+    const parsed = JSON.parse(rawJson);
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch (_) {
+    return null;
+  }
+}
 const LATENCY_NODE_FIELDS = ['ct', 'cu', 'cm', 'bd', 'node_1', 'node_2', 'node_3', 'node_4'];
 const DASHBOARD_LATENCY_COLUMNS = LATENCY_NODE_FIELDS
   .flatMap(field => [`ping_${field}`, `loss_${field}`]);
@@ -47,7 +118,7 @@ export function clearDashboardLatencyHistoryCache() {
 }
 
 export async function initDatabase(db) {
-  if (dbInitialized) return;
+  if (isDbInitialized(db)) return;
 
   debug('初始化数据库');
   
@@ -112,16 +183,22 @@ export async function initDatabase(db) {
           timestamp INTEGER DEFAULT 0
         )
       `).run();
+      await db.prepare(SERVERS_HISTORY_PARTITION_UNIQUE_INDEX_SQL).run();
     } else {
       debug('检查servers表优化状态');
       await ensureServerOptimization(db);
+      try {
+        await db.prepare(SERVERS_HISTORY_PARTITION_UNIQUE_INDEX_SQL).run();
+      } catch (idxErr) {
+        debug('创建 history_partition_id 唯一索引失败:', idxErr?.message || idxErr);
+      }
     }
 
     // 确保 metrics_history 表存在（主键 id 已编码分区与时间，无需二级索引）
     await db.prepare(createHistoryTableSql('metrics_history')).run();
 
     debug('✅ 数据库初始化完成');
-    dbInitialized = true;
+    setDbInitialized(db, true);
   } catch (e) {
     console.error('❌ 数据库初始化失败:', e);
   }
@@ -131,13 +208,21 @@ export async function clearHistory(db) {
   debug('开始清空历史数据...');
   
   try {
-    await db.prepare(`DROP TABLE IF EXISTS metrics_history`).run();
-    debug('✅ 已删除 metrics_history 表');
-
-    await db.prepare(`DROP TABLE IF EXISTS metrics_history_old`).run();
-    debug('✅ 已删除 metrics_history_old 表');
+    const rebuildStatements = [
+      db.prepare(`DROP TABLE IF EXISTS metrics_history`),
+      db.prepare(`DROP TABLE IF EXISTS metrics_history_old`),
+      db.prepare(createHistoryTableSql('metrics_history'))
+    ];
+    if (typeof db.batch === 'function') {
+      await db.batch(rebuildStatements);
+    } else {
+      for (const stmt of rebuildStatements) {
+        await stmt.run();
+      }
+    }
+    debug('✅ 已原子重建 metrics_history 表并清理 metrics_history_old 表');
     
-    dbInitialized = false;
+    setDbInitialized(db, false);
     
     await initDatabase(db);
 
@@ -165,6 +250,7 @@ function buildHistorySourceQuery(tableName, columns) {
     SELECT timestamp, ${columns} FROM ${tableName}
     WHERE id >= ?
       AND id <= ?
+      AND server_id = ?
   `;
 }
 
@@ -211,7 +297,7 @@ export async function getMetricsHistory(
   }
   const idRange = getHistoryIdRange(historyInfo.partitionId, queryStart);
 
-  const columnList = columns.split(',').map(c => c.trim()).filter(c => c && c !== 'timestamp');
+  const columnList = parseValidatedHistoryColumns(columns);
   const sourceColumns = columnList.join(', ');
   const lossColumns = columnList.filter(col => LOSS_AGG_COLUMNS.has(col));
   const lossWindowExpressions = lossColumns.map(col =>
@@ -268,21 +354,21 @@ export async function getMetricsHistory(
     const sparseResult = await db.prepare(sparseQuery.sql).bind(...sparseQuery.bindValues).all();
     rawResult = {
       ...sparseResult,
-      results: sparseResult.results
-        .filter(row => row.sample_json)
-        .map(row => JSON.parse(row.sample_json))
+      results: (sparseResult.results || [])
+        .map(row => safeParseJsonRow(row?.sample_json))
+        .filter(Boolean)
     };
   } else {
     const sourceQueries = [];
     const bindValues = [];
 
     sourceQueries.push(buildHistorySourceQuery('metrics_history', sourceColumns));
-    bindValues.push(idRange.startId, idRange.endId);
+    bindValues.push(idRange.startId, idRange.endId, String(serverId));
 
     if (oldTableExists) {
       debug('[History] 跨周查询，合并 metrics_history 和 metrics_history_old');
       sourceQueries.push(buildHistorySourceQuery('metrics_history_old', sourceColumns));
-      bindValues.push(idRange.startId, idRange.endId);
+      bindValues.push(idRange.startId, idRange.endId, String(serverId));
     }
 
     bindValues.push(intervalMs);
@@ -331,7 +417,9 @@ export async function getMetricsHistory(
 
 function normalizeLatencyHistoryValue(value, metricType) {
   if (isDisabledProbeMetric(value)) return false;
-  if (value === null || value === undefined || value === '') return null;
+  if (value === null || value === undefined || value === '' || typeof value === 'boolean' || typeof value === 'object') {
+    return null;
+  }
 
   const number = Number(value);
   if (!Number.isFinite(number)) return null;
@@ -339,7 +427,7 @@ function normalizeLatencyHistoryValue(value, metricType) {
   if (metricType === 'loss') {
     return Math.max(0, Math.min(100, Math.round(number)));
   }
-  return number > 0 ? Math.round(number) : null;
+  return number > 0 ? Math.min(MAX_PING_LATENCY_MS, Math.max(1, Math.round(number))) : null;
 }
 
 function buildLatencyHistoryPoint(row, metricType, { includeEmpty = false } = {}) {
@@ -384,10 +472,13 @@ function parseDashboardLatencySample(row) {
   }
 }
 
-function normalizeDashboardLatencyWindow(sampleRows, { queryStart, intervalMs, points }) {
+function normalizeDashboardLatencyWindow(sampleRows, { windowStart, intervalMs, points, firstActiveBucket = 0 }) {
   const rows = Array.from({ length: points }, (_, index) => {
-    const bucketTimestamp = queryStart + index * intervalMs;
-    const sample = parseDashboardLatencySample(sampleRows?.[index]);
+    const bucketTimestamp = windowStart + index * intervalMs;
+    if (index < firstActiveBucket) {
+      return { timestamp: bucketTimestamp };
+    }
+    const sample = parseDashboardLatencySample(sampleRows?.[index - firstActiveBucket]);
     if (!sample || typeof sample !== 'object') {
       return { timestamp: bucketTimestamp };
     }
@@ -455,20 +546,27 @@ export async function getDashboardLatencyHistory(db, servers, options = {}) {
         return;
       }
 
-      const queryStart = cutoff;
+      const windowStart = cutoff;
+      const queryStart = Math.max(cutoff, historyInfo.startTimestamp || 0);
       if (queryStart >= queryEnd) {
         result.set(serverId, { ping: [], loss: [] });
         return;
       }
 
-      const intervalMs = Math.max(10_000, Math.ceil((queryEnd - queryStart) / points));
+      const intervalMs = Math.max(10_000, Math.ceil((queryEnd - windowStart) / points));
+      const firstActiveBucket = Math.min(
+        points - 1,
+        Math.max(0, Math.floor((queryStart - windowStart) / intervalMs))
+      );
+      const effectiveQueryStart = Math.max(queryStart, windowStart + firstActiveBucket * intervalMs);
+      const firstRangeEnd = Math.min(queryEnd, windowStart + (firstActiveBucket + 1) * intervalMs);
       const idPrefix = getHistoryIdRange(historyInfo.partitionId).startId;
       const querySparseHistory = async queryColumns => {
         const sparseQuery = buildSparseHistoryQuery({
           columns: queryColumns,
-          queryStart,
+          queryStart: effectiveQueryStart,
           queryEnd,
-          firstRangeEnd: Math.min(queryEnd, queryStart + intervalMs),
+          firstRangeEnd,
           intervalMs,
           idPrefix,
           oldTableExists,
@@ -479,7 +577,12 @@ export async function getDashboardLatencyHistory(db, servers, options = {}) {
       };
 
       const rawResult = await querySparseHistory(columns);
-      const window = normalizeDashboardLatencyWindow(rawResult.results, { queryStart, intervalMs, points });
+      const window = normalizeDashboardLatencyWindow(rawResult.results, {
+        windowStart,
+        intervalMs,
+        points,
+        firstActiveBucket
+      });
       result.set(serverId, window);
       if (useCache) {
         dashboardLatencyHistoryCache.set(serverId, { cachedAt: now, window });
@@ -510,25 +613,28 @@ export async function weeklyCleanup(db) {
   try {
     debug('[Cleanup] 开始执行表轮换操作...');
     
-    // 1. 删除旧的 metrics_history_old 表（如果存在）
-    await db.prepare(`DROP TABLE IF EXISTS metrics_history_old`).run();
-    debug('[Cleanup] 已删除旧的 metrics_history_old 表');
-    
-    // 2. 将 metrics_history 重命名为 metrics_history_old
     const currentTable = await db.prepare(
       `SELECT name FROM sqlite_master WHERE type='table' AND name='metrics_history'`
     ).first();
-    
-    if (currentTable) {
-      await db.prepare(`ALTER TABLE metrics_history RENAME TO metrics_history_old`).run();
-      debug('[Cleanup] 已将 metrics_history 重命名为 metrics_history_old');
-    }
-  
-    // 3. 重新初始化数据库以创建新的 metrics_history 表
-    dbInitialized = false;
-    await initDatabase(db);
 
-    debug('[Cleanup] 已创建新的 metrics_history 表');
+    const rotationStatements = [
+      db.prepare(`DROP TABLE IF EXISTS metrics_history_old`),
+      ...(currentTable ? [db.prepare(`ALTER TABLE metrics_history RENAME TO metrics_history_old`)] : []),
+      db.prepare(createHistoryTableSql('metrics_history'))
+    ];
+
+    if (typeof db.batch === 'function') {
+      await db.batch(rotationStatements);
+    } else {
+      for (const stmt of rotationStatements) {
+        await stmt.run();
+      }
+    }
+    debug('[Cleanup] 已原子完成 metrics_history 表轮换与重建');
+  
+    setDbInitialized(db, false);
+    await initDatabase(db);
+    clearDashboardLatencyHistoryCache();
     
     return {
       success: true,
@@ -541,107 +647,125 @@ export async function weeklyCleanup(db) {
 }
 
 export async function saveMetricsHistory(db, serverId, historyPartitionId, metrics, regionCode = '', timestamp = null, agentVersion = '') {
-  const historyId = buildHistoryId(historyPartitionId, timestamp);
-  const rawTimestamp = Number(timestamp);
-  const now = Number.isFinite(rawTimestamp) && rawTimestamp > 0
-    ? (rawTimestamp < 10000000000 ? rawTimestamp * 1000 : rawTimestamp)
-    : Date.now();
-
+  const safeMetrics = metrics && typeof metrics === 'object' && !Array.isArray(metrics) ? metrics : {};
   const DISABLED_PROBE_VALUE = 'false';
 
   const parsePing = (val) => {
     if (isDisabledProbeMetric(val)) return DISABLED_PROBE_VALUE;
-    const num = parseInt(val);
-    return (num > 0) ? num : null;
+    if (val === null || val === undefined || val === '' || typeof val === 'boolean' || typeof val === 'object') {
+      return null;
+    }
+    const num = Number(val);
+    if (!Number.isFinite(num) || num <= 0) return null;
+    return Math.min(MAX_PING_LATENCY_MS, Math.max(1, Math.round(num)));
   };
 
   const parseLoss = (val) => {
     if (isDisabledProbeMetric(val)) return DISABLED_PROBE_VALUE;
-    const num = parseInt(val);
-    if (Number.isNaN(num)) return null;
-    return Math.max(0, Math.min(100, num));
-  };
-
-  const insertHistoryRow = async () => {
-    const diskMetrics = flattenDiskMetrics(metrics);
-
-    await db.prepare(`
-    INSERT INTO metrics_history (
-      ${HISTORY_INSERT_COLUMNS.join(', ')}
-    ) VALUES (
-      ${HISTORY_INSERT_COLUMNS.map(() => '?').join(', ')}
-    )
-  `).bind(
-    historyId,
-    serverId,
-    now,
-    agentVersion || '',
-    parseFloat(metrics.cpu) || 0,
-    metrics.load || metrics.load_avg || '0 0 0',
-    parseFloat(metrics.net_in_speed) || 0,
-    parseFloat(metrics.net_out_speed) || 0,
-    parseFloat(metrics.net_rx) || 0,
-    parseFloat(metrics.net_tx) || 0,
-    parseInt(metrics.processes) || 0,
-    parseInt(metrics.tcp_conn) || 0,
-    parseInt(metrics.udp_conn) || 0,
-    parsePing(metrics.ping_ct),
-    parsePing(metrics.ping_cu),
-    parsePing(metrics.ping_cm),
-    parsePing(metrics.ping_bd),
-    parsePing(metrics.ping_node_1),
-    parsePing(metrics.ping_node_2),
-    parsePing(metrics.ping_node_3),
-    parsePing(metrics.ping_node_4),
-    parseLoss(metrics.loss_ct),
-    parseLoss(metrics.loss_cu),
-    parseLoss(metrics.loss_cm),
-    parseLoss(metrics.loss_bd),
-    parseLoss(metrics.loss_node_1),
-    parseLoss(metrics.loss_node_2),
-    parseLoss(metrics.loss_node_3),
-    parseLoss(metrics.loss_node_4),
-    parseFloat(metrics.ram_total) || 0,
-    parseFloat(metrics.ram_used) || 0,
-    parseFloat(metrics.swap_total) || 0,
-    parseFloat(metrics.swap_used) || 0,
-    parseFloat(metrics.disk_total) || 0,
-    parseFloat(metrics.disk_used) || 0,
-    diskMetrics.disk_read_bps,
-    diskMetrics.disk_write_bps,
-    diskMetrics.disk_read_iops,
-    diskMetrics.disk_write_iops,
-    diskMetrics.disk_await_ms,
-    diskMetrics.disk_util,
-    parseInt(metrics.cpu_cores) || 0,
-    metrics.cpu_info || '',
-    Array.isArray(metrics.gpu_info) ? JSON.stringify(metrics.gpu_info) : (metrics.gpu_info || ''),
-    metrics.arch || '',
-    metrics.os || '',
-    metrics.kernel_version || '',
-    regionCode,
-    metrics.ip_v4 || '0',
-    metrics.ip_v6 || '0',
-    metrics.boot_time || '',
-    parseFloat(metrics.net_rx_monthly) || 0,
-    parseFloat(metrics.net_tx_monthly) || 0
-    ).run();
+    if (val === null || val === undefined || val === '' || typeof val === 'boolean' || typeof val === 'object') {
+      return null;
+    }
+    const num = Number(val);
+    if (!Number.isFinite(num)) return null;
+    return Math.max(0, Math.min(100, Math.round(num)));
   };
 
   try {
-    await insertHistoryRow();
-  } catch (e) {
-    if (e?.message && /has no column/i.test(e.message)) {
-      console.warn('检测到数据库字段缺失，尝试添加缺失字段...');
-      await addHistoryColumns(db);
-      try {
-        await insertHistoryRow();
-      } catch (retryError) {
-        console.error('保存历史数据失败:', retryError);
+    const now = clampMetricTimestamp(timestamp, Date.now());
+    const historyId = buildHistoryId(historyPartitionId, now);
+
+    const insertHistoryRow = async () => {
+      const diskMetrics = flattenDiskMetrics(safeMetrics);
+
+      // 同一服务器同一秒的上报（如客户端超时重试撞车）会命中 id 唯一约束，
+      // 普通 INSERT 会静默丢样本：改为 upsert，同秒重复上报时以最新数据覆盖。
+      const upsertColumns = HISTORY_INSERT_COLUMNS.filter(column => column !== 'id');
+      await db.prepare(`
+      INSERT INTO metrics_history (
+        ${HISTORY_INSERT_COLUMNS.join(', ')}
+      ) VALUES (
+        ${HISTORY_INSERT_COLUMNS.map(() => '?').join(', ')}
+      )
+      ON CONFLICT(id) DO UPDATE SET
+        ${upsertColumns.map(column => `${column} = excluded.${column}`).join(', ')}
+    `).bind(
+      historyId,
+      toSafeMetricString(serverId, 64, ''),
+      now,
+      toSafeMetricString(agentVersion, 64, ''),
+      toSafeMetricFloat(safeMetrics.cpu, { min: 0, max: 100, fallback: 0 }),
+      toSafeMetricString(safeMetrics.load ?? safeMetrics.load_avg, 64, '0 0 0'),
+      toSafeMetricFloat(safeMetrics.net_in_speed),
+      toSafeMetricFloat(safeMetrics.net_out_speed),
+      toSafeMetricFloat(safeMetrics.net_rx),
+      toSafeMetricFloat(safeMetrics.net_tx),
+      toSafeMetricInt(safeMetrics.processes),
+      toSafeMetricInt(safeMetrics.tcp_conn),
+      toSafeMetricInt(safeMetrics.udp_conn),
+      parsePing(safeMetrics.ping_ct),
+      parsePing(safeMetrics.ping_cu),
+      parsePing(safeMetrics.ping_cm),
+      parsePing(safeMetrics.ping_bd),
+      parsePing(safeMetrics.ping_node_1),
+      parsePing(safeMetrics.ping_node_2),
+      parsePing(safeMetrics.ping_node_3),
+      parsePing(safeMetrics.ping_node_4),
+      parseLoss(safeMetrics.loss_ct),
+      parseLoss(safeMetrics.loss_cu),
+      parseLoss(safeMetrics.loss_cm),
+      parseLoss(safeMetrics.loss_bd),
+      parseLoss(safeMetrics.loss_node_1),
+      parseLoss(safeMetrics.loss_node_2),
+      parseLoss(safeMetrics.loss_node_3),
+      parseLoss(safeMetrics.loss_node_4),
+      toSafeMetricFloat(safeMetrics.ram_total),
+      toSafeMetricFloat(safeMetrics.ram_used),
+      toSafeMetricFloat(safeMetrics.swap_total),
+      toSafeMetricFloat(safeMetrics.swap_used),
+      toSafeMetricFloat(safeMetrics.disk_total),
+      toSafeMetricFloat(safeMetrics.disk_used),
+      diskMetrics.disk_read_bps,
+      diskMetrics.disk_write_bps,
+      diskMetrics.disk_read_iops,
+      diskMetrics.disk_write_iops,
+      diskMetrics.disk_await_ms,
+      diskMetrics.disk_util,
+      toSafeMetricInt(safeMetrics.cpu_cores, { min: 0, max: 65535, fallback: 0 }),
+      toSafeMetricString(safeMetrics.cpu_info, 256, ''),
+      sanitizeGpuInfo(safeMetrics.gpu_info, 4096),
+      toSafeMetricString(safeMetrics.arch, 64, ''),
+      toSafeMetricString(safeMetrics.os, 128, ''),
+      toSafeMetricString(safeMetrics.kernel_version, 128, ''),
+      toSafeMetricString(regionCode, 32, ''),
+      toSafeMetricString(safeMetrics.ip_v4, 64, '0'),
+      toSafeMetricString(safeMetrics.ip_v6, 128, '0'),
+      toSafeMetricString(safeMetrics.boot_time, 64, ''),
+      toSafeMetricFloat(safeMetrics.net_rx_monthly),
+      toSafeMetricFloat(safeMetrics.net_tx_monthly)
+      ).run();
+    };
+
+    try {
+      await insertHistoryRow();
+      return { ok: true };
+    } catch (e) {
+      if (e?.message && /has no column/i.test(e.message)) {
+        console.warn('检测到数据库字段缺失，尝试添加缺失字段...');
+        await addHistoryColumns(db);
+        try {
+          await insertHistoryRow();
+          return { ok: true };
+        } catch (retryError) {
+          console.error('保存历史数据失败:', retryError);
+          return { ok: false, error: retryError?.message || String(retryError) };
+        }
       }
-      return;
+      console.error('保存历史数据失败:', e);
+      return { ok: false, error: e?.message || String(e) };
     }
-    console.error('保存历史数据失败:', e);
+  } catch (outerError) {
+    console.error('保存历史数据失败:', outerError);
+    return { ok: false, error: outerError?.message || String(outerError) };
   }
 }
 
@@ -660,9 +784,10 @@ export async function getLatestMetrics(db, serverId, server = null) {
       SELECT * FROM metrics_history
       WHERE id >= ?
         AND id <= ?
+        AND server_id = ?
       ORDER BY id DESC
       LIMIT 1
-    `).bind(startId, endId).first();
+    `).bind(startId, endId, String(serverId)).first();
     return result ? normalizeProbeMetricRow(result) : null;
   } catch (e) {
     console.error('获取最新指标数据失败:', e);
@@ -715,8 +840,8 @@ export async function getLatestMetricsForAllServers(db) {
       try {
         batchResults = await db.batch(chunk.map(item =>
           db.prepare(
-            'SELECT * FROM metrics_history WHERE id >= ? AND id <= ? ORDER BY id DESC LIMIT 1'
-          ).bind(item.startId, item.endId)
+            'SELECT * FROM metrics_history WHERE id >= ? AND id <= ? AND server_id = ? ORDER BY id DESC LIMIT 1'
+          ).bind(item.startId, item.endId, String(item.server.id))
         ));
       } catch (batchError) {
         // 整批失败时回退逐台查询，保持"单台异常不影响其它台"的既有语义
@@ -803,8 +928,8 @@ export async function getLatestTimestampsForAllServers(db, { servers = null } = 
       const chunk = items.slice(offset, offset + LATEST_QUERY_CHUNK_SIZE);
       const batchResults = await db.batch(chunk.map(item =>
         db.prepare(
-          'SELECT timestamp FROM metrics_history WHERE id >= ? AND id <= ? ORDER BY id DESC LIMIT 1'
-        ).bind(item.startId, item.endId)
+          'SELECT timestamp FROM metrics_history WHERE id >= ? AND id <= ? AND server_id = ? ORDER BY id DESC LIMIT 1'
+        ).bind(item.startId, item.endId, String(item.serverId))
       ));
       for (let index = 0; index < chunk.length; index++) {
         const rows = batchResults[index] && batchResults[index].results;

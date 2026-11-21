@@ -10,6 +10,8 @@ import { http, DEFAULT_REQUEST_TIMEOUT_MS } from './utils/http'
 import { initConfig, hasMultipleApiBases } from './utils/config'
 import { LAST_AGENT_VERSION, LAST_WORKERS_VERSION, VERSION, normalizeLiveSocketTimeoutMinutes } from './utils/api'
 import { resolveDisplayMode } from './utils/displayMode'
+import { resolveCustomPingNodeName } from './utils/server'
+import { safeLocalStorage } from './utils/storage'
 import { getMikusAssetUrl, isMikusThemeEnabled, normalizeThemeOptions, setMikusThemeClass } from './utils/themeOptions'
 import { applyDefaultTheme } from './composables/useTheme'
 import {
@@ -22,8 +24,12 @@ import {
   setTurnstileToken
 } from './utils/turnstile'
 
+const safeGetStorage = (key) => safeLocalStorage.getItem(key)
+
+const safeRemoveStorage = (key) => safeLocalStorage.removeItem(key)
+
 const getTranslation = () => {
-  const lang = currentLang.value || resolveLanguagePreference(localStorage.getItem(STORAGE.LANGUAGE_PREFERENCE) || 'auto')
+  const lang = currentLang.value || resolveLanguagePreference(safeGetStorage(STORAGE.LANGUAGE_PREFERENCE) || 'auto')
   return translations[lang] || translations.en
 }
 
@@ -69,22 +75,34 @@ const applyStartupThemeOptions = (config) => {
   }
 }
 
+const buildNormalizedPingNodeNames = (source = {}) => ({
+  custom_ct_name: resolveCustomPingNodeName('custom_ct', source.custom_ct_name),
+  custom_cu_name: resolveCustomPingNodeName('custom_cu', source.custom_cu_name),
+  custom_cm_name: resolveCustomPingNodeName('custom_cm', source.custom_cm_name),
+  custom_bd_name: resolveCustomPingNodeName('custom_bd', source.custom_bd_name),
+  node_1_name: resolveCustomPingNodeName('node_1', source.node_1_name),
+  node_2_name: resolveCustomPingNodeName('node_2', source.node_2_name),
+  node_3_name: resolveCustomPingNodeName('node_3', source.node_3_name),
+  node_4_name: resolveCustomPingNodeName('node_4', source.node_4_name)
+})
+
 async function fetchConfig() {
   try {
     let result = await http.get('/api/config', { includeAuth: true, includeTurnstile: true, autoRedirect: false, timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS })
 
     // 超时或 403：清掉可疑的 Turnstile 缓存，不带 header 重试走 bypass 路径
     if (result.error && (result.timeout || result.status === 403)) {
-      localStorage.removeItem(STORAGE.TURNSTILE_TOKEN)
-      localStorage.removeItem(STORAGE.TURNSTILE_VERIFIED)
+      safeRemoveStorage(STORAGE.TURNSTILE_TOKEN)
+      safeRemoveStorage(STORAGE.TURNSTILE_VERIFIED)
       result = await http.get('/api/config', { includeAuth: true, includeTurnstile: false, includeTurnstileVerified: false, autoRedirect: false, timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS })
     }
 
-    if (result.error) {
+    if (result.error || !result.data) {
       return {
         turnstile_enabled: false,
         turnstile_login_enabled: false,
         turnstile_site_key: '',
+        ...buildNormalizedPingNodeNames(),
         display_mode: 'bar',
         preferred_theme: 'auto',
         default_language: 'auto',
@@ -98,23 +116,6 @@ async function fetchConfig() {
     }
 
     const data = result.data
-    if (!data) {
-      return {
-        turnstile_enabled: false,
-        turnstile_login_enabled: false,
-        turnstile_site_key: '',
-        display_mode: 'bar',
-        preferred_theme: 'auto',
-        default_language: 'auto',
-        version: '',
-        last_workers_version: '',
-        last_agent_version: '',
-        frontend_ws_timeout_minutes: 0,
-        theme_options: {},
-        verified: false
-      }
-    }
-
     const turnstileEnabled = isTurnstileValueEnabled(data.turnstile_enabled)
     const turnstileLoginEnabled = isTurnstileValueEnabled(data.turnstile_login_enabled)
     const turnstileSiteKey = data.turnstile_site_key || ''
@@ -141,14 +142,7 @@ async function fetchConfig() {
       turnstile_enabled: turnstileEnabled,
       turnstile_login_enabled: turnstileLoginEnabled,
       turnstile_site_key: turnstileSiteKey,
-      custom_ct_name: data.custom_ct_name || '电信',
-      custom_cu_name: data.custom_cu_name || '联通',
-      custom_cm_name: data.custom_cm_name || '移动',
-      custom_bd_name: data.custom_bd_name || 'BGP',
-      node_1_name: data.node_1_name || 'Node 1',
-      node_2_name: data.node_2_name || 'Node 2',
-      node_3_name: data.node_3_name || 'Node 3',
-      node_4_name: data.node_4_name || 'Node 4',
+      ...buildNormalizedPingNodeNames(data),
       version,
       last_workers_version: lastWorkersVersion,
       last_agent_version: lastAgentVersion,
@@ -169,8 +163,7 @@ async function fetchConfig() {
     turnstile_enabled: false,
     turnstile_login_enabled: false,
     turnstile_site_key: '',
-    custom_ct_name: '电信', custom_cu_name: '联通', custom_cm_name: '移动', custom_bd_name: 'BGP',
-    node_1_name: 'Node 1', node_2_name: 'Node 2', node_3_name: 'Node 3', node_4_name: 'Node 4',
+    ...buildNormalizedPingNodeNames(),
     display_mode: 'bar',
     preferred_theme: 'auto',
     default_language: 'auto',
@@ -316,6 +309,7 @@ async function initApp() {
         turnstile_login_enabled: isTurnstileValueEnabled(first.data.turnstile_login_enabled),
         turnstile_site_key: sharedTurnstileSite?.siteKey || first.data.turnstile_site_key || '',
         turnstile_api_index: sharedTurnstileSite?.index || 0,
+        ...buildNormalizedPingNodeNames(first.data),
         site_configs: results.map(result => (!result.error && result.data) ? result.data : null),
         version: first.data.version || '',
         last_workers_version: first.data.last_workers_version || '',
@@ -329,7 +323,7 @@ async function initApp() {
         default_language: normalizeLanguagePreference(first.data.default_language),
         frontend_ws_timeout_minutes: normalizeLiveSocketTimeoutMinutes(first.data.frontend_ws_timeout_minutes),
         theme_options: normalizeThemeOptions(first.data.theme_options)
-      } : { turnstile_enabled: false, turnstile_login_enabled: false, turnstile_site_key: '', turnstile_api_index: 0, version: '', last_workers_version: '', last_agent_version: '', verified: false, is_public: true, authorization: false, site_title: '', display_mode: 'bar', preferred_theme: 'auto', default_language: 'auto', frontend_ws_timeout_minutes: 0, theme_options: {} }
+      } : { turnstile_enabled: false, turnstile_login_enabled: false, turnstile_site_key: '', turnstile_api_index: 0, ...buildNormalizedPingNodeNames(), version: '', last_workers_version: '', last_agent_version: '', verified: false, is_public: true, authorization: false, site_title: '', display_mode: 'bar', preferred_theme: 'auto', default_language: 'auto', frontend_ws_timeout_minutes: 0, theme_options: {} }
       if (sharedTurnstileSite) {
         config.turnstile_enabled = true
         config.turnstile_site_key = sharedTurnstileSite.siteKey
@@ -339,7 +333,7 @@ async function initApp() {
       LAST_WORKERS_VERSION.value = config.last_workers_version || ''
       LAST_AGENT_VERSION.value = config.last_agent_version || ''
     } catch (_) {
-      config = { turnstile_enabled: false, turnstile_login_enabled: false, turnstile_site_key: '', turnstile_api_index: 0, version: '', last_workers_version: '', last_agent_version: '', verified: false, is_public: true, authorization: false, site_title: '', display_mode: 'bar', preferred_theme: 'auto', default_language: 'auto', frontend_ws_timeout_minutes: 0, theme_options: {} }
+      config = { turnstile_enabled: false, turnstile_login_enabled: false, turnstile_site_key: '', turnstile_api_index: 0, ...buildNormalizedPingNodeNames(), version: '', last_workers_version: '', last_agent_version: '', verified: false, is_public: true, authorization: false, site_title: '', display_mode: 'bar', preferred_theme: 'auto', default_language: 'auto', frontend_ws_timeout_minutes: 0, theme_options: {} }
     }
   } else {
     config = await fetchConfig()

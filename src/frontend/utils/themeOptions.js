@@ -12,7 +12,7 @@ const MIKUS_MOBILE_SAKURA_COUNT = 10
 
 export const isThemeOptionEnabled = (options, key) => {
   const normalizedOptions = normalizeThemeOptions(options)
-  if (!Object.prototype.hasOwnProperty.call(normalizedOptions, key)) return false
+  if (!Object.hasOwn(normalizedOptions, key)) return false
 
   const value = normalizedOptions[key]
   if (value === null || value === undefined) return false

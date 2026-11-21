@@ -1,4 +1,7 @@
+import { HISTORY_TABLE_COLUMNS } from '../utils/historyFields.js';
+
 const SPARSE_HISTORY_MIN_HOURS = 1;
+const VALID_HISTORY_COLUMN_SET = new Set(HISTORY_TABLE_COLUMNS.map(([name]) => name));
 
 export function shouldUseSparseHistorySampling(queryHours) {
   return queryHours > SPARSE_HISTORY_MIN_HOURS;
@@ -26,7 +29,12 @@ export function buildSparseHistoryQuery({
   tableBoundary,
   sampleOrder = 'ASC'
 }) {
-  const columnList = columns.split(',').map(column => column.trim()).filter(Boolean);
+  const columnList = String(columns || '').split(',').map(column => column.trim()).filter(Boolean);
+  for (const col of columnList) {
+    if (!VALID_HISTORY_COLUMN_SET.has(col)) {
+      throw new Error(`Invalid history column: ${col}`);
+    }
+  }
   const jsonColumns = ['timestamp', ...columnList]
     .flatMap(column => [`'${column}'`, column])
     .join(', ');
@@ -47,7 +55,9 @@ export function buildSparseHistoryQuery({
     const oldSample = buildSampleJsonExpression('metrics_history_old', jsonColumns, normalizedSampleOrder);
     sampleExpression = `COALESCE(
         CASE WHEN ranges.range_start < ? THEN ${oldSample} END,
-        CASE WHEN ranges.range_end > ? THEN ${currentSample} END
+        CASE WHEN ranges.range_end > ? THEN ${currentSample} END,
+        ${currentSample},
+        ${oldSample}
       )`;
     bindValues.push(tableBoundary, tableBoundary);
   }

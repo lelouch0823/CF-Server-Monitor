@@ -25,14 +25,14 @@
         >
         <button v-if="newServerGroup" @click="newServerGroup = ''" class="toolbar-select-clear" aria-label="Clear">✕</button>
       </div>
-      <button @click="$emit('add-server')" class="btn btn-primary">+ {{ trans.addServer }}</button>
+      <button @click="$emit('add-server')" class="btn btn-primary" :disabled="addingServer">{{ addingServer ? '⏳ ' + trans.saving : '+ ' + trans.addServer }}</button>
       <button @click="$emit('auto-discovery-cmd')" class="btn">🤖 {{ trans.autoAdd }}</button>
     </div>
 
     <div class="batch-actions">
       <button @click="$emit('batch-edit')" class="btn btn-blue" :disabled="selectedServers.length === 0">✏️ {{ trans.batchEdit }}</button>
-      <button @click="$emit('batch-delete')" class="btn btn-red">🗑 {{ trans.batchDelete }}</button>
-      <button @click="$emit('toggle-select-all')" class="btn">☐ {{ trans.toggleAll }}</button>
+      <button @click="$emit('batch-delete')" class="btn btn-red" :disabled="selectedServers.length === 0 || deletingServer">{{ deletingServer ? '⏳ ' + trans.deleting : '🗑 ' + trans.batchDelete }}</button>
+      <button @click="$emit('toggle-select-all')" class="btn" :disabled="servers.length === 0">☐ {{ trans.toggleAll }}</button>
       <button @click="$emit('refresh-cache')" class="btn" :disabled="cacheRefreshing">{{ cacheRefreshing ? '⏳' : '🔄' }} {{ trans.refreshCache }}</button>
     </div>
 
@@ -43,7 +43,7 @@
             <th class="table-center-cell col-width-35">
               <HelpTooltip :text="trans.dragSort" />
             </th>
-            <th class="col-width-30"><input type="checkbox" id="select-all" @change="$emit('select-all', $event)" class="checkbox-accent-green"></th>
+            <th class="col-width-30"><input type="checkbox" id="select-all" :checked="isAllSelected" :indeterminate.prop="isIndeterminate" :disabled="servers.length === 0" @change="$emit('select-all', $event)" class="checkbox-accent-green"></th>
             <th>{{ trans.hostname.toUpperCase() }}</th>
             <th>IP</th>
             <th>{{ trans.group.toUpperCase() }}</th>
@@ -80,12 +80,8 @@
             <td class="table-center-cell"><input type="checkbox" class="server-checkbox" :value="server.id" :checked="selectedServers.includes(server.id)" @change="$emit('toggle-server', server.id)"></td>
             <td>
               <div class="server-info">
-                <span v-if="server.region && server.region !== 'xx'" class="country-os-icons">
-                  <img :src="getPublicAssetUrl('flags/' + getFlagRegionCode(server.region) + '.svg')" :alt="server.region" class="flag-img">
-                  <OsIcon :os="server.os" />
-                </span>
-                <span v-else class="country-os-icons">
-                  <span class="flag-fallback">🏳️</span>
+                <span class="country-os-icons">
+                  <RegionFlag :region="server.region" />
                   <OsIcon :os="server.os" />
                 </span>
                 <a
@@ -111,7 +107,7 @@
               </div>
               <span v-else>-</span>
             </td>
-            <td>{{ server.server_group || trans.default }}</td>
+            <td><span class="server-group-cell">{{ server.server_group || trans.default }}</span></td>
             <td>
               <div v-if="splitTags(server.tags).length" class="tag-list admin-tag-list">
                 <span v-for="(tag, index) in splitTags(server.tags)" :key="tag" :class="['badge', 'badge-tag', tagColorClass(index)]">{{ tag }}</span>
@@ -142,8 +138,8 @@
               <span
                 class="spec-text"
                 :class="{ 'spec-copied': isSpecCopied(server, 'traffic_limit') }"
-                @click.stop="emitCopySpec(server, 'traffic_limit', server.traffic_limit ? formatBytes(server.traffic_limit * 1024 * 1024 * 1024) : '')"
-              >{{ server.traffic_limit ? formatBytes(server.traffic_limit * 1024 * 1024 * 1024) : '-' }}</span>
+                @click.stop="emitCopySpec(server, 'traffic_limit', Number(server.traffic_limit) > 0 ? formatBytes(gbToBytes(server.traffic_limit)) : '')"
+              >{{ Number(server.traffic_limit) > 0 ? formatBytes(gbToBytes(server.traffic_limit)) : '-' }}</span>
             </td>
             <td>
               <span
@@ -173,11 +169,11 @@
 
 <script setup>
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
-import { getFlagRegionCode, formatBytes } from '../../../utils/api'
-import { getPublicAssetUrl } from '../../../utils/config'
+import { formatBytes, gbToBytes } from '../../../utils/api'
 import { currentLang } from '../../../utils/i18n'
 import { detectBillingCycle, detectCurrencySymbol, getBillingCycleOption, getLocalizedOptionField, isEnabledFlag, isFreePrice, normalizeCurrency, normalizePrice } from '../../../utils/server.js'
 import OsIcon from '../../../components/OsIcon.vue'
+import RegionFlag from '../../../components/RegionFlag.vue'
 import HelpTooltip from '../../../components/HelpTooltip.vue'
 
 const props = defineProps({
@@ -189,6 +185,8 @@ const props = defineProps({
   selectedApiIndex: { type: Number, default: 0 },
   latestAgentVersion: { type: String, default: '' },
   cacheRefreshing: { type: Boolean, default: false },
+  addingServer: { type: Boolean, default: false },
+  deletingServer: { type: Boolean, default: false },
   copiedServerId: { type: [String, Number], default: null },
   copiedNoteServerId: { type: [String, Number], default: null },
   copiedSpecKey: { type: String, default: null }
@@ -206,6 +204,20 @@ const emit = defineEmits([
 const POINTER_DRAG_THRESHOLD = 6
 const CUSTOM_SERVER_GROUP_VALUE = '__custom__'
 let pointerDragState = null
+
+const selectedInTableCount = computed(() => {
+  if (props.servers.length === 0 || props.selectedServers.length === 0) return 0
+  const selectedSet = new Set(props.selectedServers.map(id => String(id)))
+  return props.servers.filter(server => selectedSet.has(String(server.id))).length
+})
+
+const isAllSelected = computed(() => (
+  props.servers.length > 0 && selectedInTableCount.value === props.servers.length
+))
+
+const isIndeterminate = computed(() => (
+  selectedInTableCount.value > 0 && selectedInTableCount.value < props.servers.length
+))
 
 const serverGroupOptions = computed(() => {
   const defaultLabel = props.trans.default || 'Default'

@@ -13,6 +13,41 @@ import { isSupportedLanguage, normalizeLanguagePreference, normalizeNotification
 const LANGUAGE_STORAGE_KEY = STORAGE.LANGUAGE_PREFERENCE
 let defaultLanguage = AUTO_LANGUAGE
 
+const safeGetStorageItem = (key) => {
+  try {
+    if (typeof localStorage === 'undefined' || !localStorage) return null
+    return localStorage.getItem(key)
+  } catch (_) {
+    return null
+  }
+}
+
+const safeSetStorageItem = (key, value) => {
+  try {
+    if (typeof localStorage === 'undefined' || !localStorage) return false
+    localStorage.setItem(key, String(value))
+    return true
+  } catch (_) {
+    return false
+  }
+}
+
+const syncDocumentLang = (lang) => {
+  try {
+    if (typeof document !== 'undefined' && document?.documentElement && lang) {
+      document.documentElement.lang = lang === 'zh' ? 'zh-CN' : lang
+    }
+  } catch (_) {}
+}
+
+const dispatchLanguageChanged = (lang) => {
+  try {
+    if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function' && typeof CustomEvent === 'function') {
+      window.dispatchEvent(new CustomEvent('languageChanged', { detail: { lang } }))
+    }
+  } catch (_) {}
+}
+
 // 默认语言随主包一起加载，其余语言在切换或启动命中时按需加载。
 export const translations = reactive({ [DEFAULT_LANGUAGE]: defaultLocale })
 const loadedLanguages = new Set([DEFAULT_LANGUAGE])
@@ -65,7 +100,8 @@ export const resolveLanguagePreference = (lang) => {
   return value === AUTO_LANGUAGE ? getBrowserLanguage() : value
 }
 
-const currentLang = ref(resolveLanguagePreference(localStorage.getItem(LANGUAGE_STORAGE_KEY) || defaultLanguage))
+const currentLang = ref(resolveLanguagePreference(safeGetStorageItem(LANGUAGE_STORAGE_KEY) || defaultLanguage))
+syncDocumentLang(currentLang.value)
 
 const loadLanguage = (code) => {
   if (loadedLanguages.has(code)) return Promise.resolve(true)
@@ -100,8 +136,9 @@ export const setLanguage = async (lang) => {
   const loaded = await loadLanguage(resolvedLang)
   if (!loaded) return false
   currentLang.value = resolvedLang
-  localStorage.setItem(LANGUAGE_STORAGE_KEY, resolvedLang)
-  window.dispatchEvent(new CustomEvent('languageChanged', { detail: { lang: resolvedLang } }))
+  safeSetStorageItem(LANGUAGE_STORAGE_KEY, resolvedLang)
+  syncDocumentLang(resolvedLang)
+  dispatchLanguageChanged(resolvedLang)
   return true
 }
 
@@ -110,12 +147,13 @@ export const getLanguage = () => currentLang.value
 export const applyDefaultLanguage = async (lang) => {
   defaultLanguage = normalizeLanguagePreference(lang)
   // 没有有效的本地偏好时使用站点默认语言，再将 auto 解析为浏览器语言。
-  const storedLanguage = normalizeLanguagePreference(localStorage.getItem(LANGUAGE_STORAGE_KEY), defaultLanguage)
+  const storedLanguage = normalizeLanguagePreference(safeGetStorageItem(LANGUAGE_STORAGE_KEY), defaultLanguage)
   const resolvedLang = resolveLanguagePreference(storedLanguage)
   const loaded = await loadLanguage(resolvedLang)
   const nextLang = loaded ? resolvedLang : DEFAULT_LANGUAGE
   currentLang.value = nextLang
-  window.dispatchEvent(new CustomEvent('languageChanged', { detail: { lang: nextLang } }))
+  syncDocumentLang(nextLang)
+  dispatchLanguageChanged(nextLang)
   return nextLang
 }
 

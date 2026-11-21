@@ -15,7 +15,11 @@ if (fs.existsSync(distDir)) {
 }
 
 console.log('Building frontend...');
-execSync('npx vite build', { cwd: rootDir, stdio: 'inherit' });
+execSync('npx vite build', {
+  cwd: rootDir,
+  stdio: 'inherit',
+  env: { ...process.env, VITE_DISABLE_MKCERT: '1' }
+});
 
 console.log('Copying static assets...');
 if (fs.existsSync(publicDir)) {

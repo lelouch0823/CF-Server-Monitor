@@ -63,7 +63,7 @@
             @click="setFilter(item.code)"
           >
             <span v-if="item.code === 'unknown'" class="filter-tag-icon">🏳️</span>
-            <img v-else-if="item.flagCode" :src="getPublicAssetUrl('flags/' + item.flagCode + '.svg')" :alt="item.code">
+            <RegionFlag v-else-if="item.flagCode" :region="item.code" :alt="item.code" />
             <span class="filter-tag-label">{{ item.label }}</span>
             <span class="filter-tag-count">{{ item.count }}</span>
           </button>
@@ -88,7 +88,7 @@
                 @click="setFilter(item.code)"
               >
                 <span v-if="item.code === 'unknown'" class="filter-tag-icon">🏳️</span>
-                <img v-else-if="item.flagCode" :src="getPublicAssetUrl('flags/' + item.flagCode + '.svg')" :alt="item.code">
+                <RegionFlag v-else-if="item.flagCode" :region="item.code" :alt="item.code" />
                 <span class="filter-tag-label">{{ item.label }}</span>
                 <span class="filter-tag-count">{{ item.count }}</span>
               </button>
@@ -103,7 +103,7 @@
             class="filter-tag filter-measure-tag"
           >
             <span v-if="item.code === 'unknown'" class="filter-tag-icon">🏳️</span>
-            <img v-else-if="item.flagCode" :src="getPublicAssetUrl('flags/' + item.flagCode + '.svg')" :alt="item.code">
+            <RegionFlag v-else-if="item.flagCode" :region="item.code" :alt="item.code" />
             <span class="filter-tag-label">{{ item.label }}</span>
             <span class="filter-tag-count">{{ item.count }}</span>
           </button>
@@ -165,7 +165,7 @@
               v-for="server in group.servers"
               :key="server.id + '-' + currentView"
               :server="server"
-              :sys-config="sysConfig"
+              :sys-config="localizedSysConfig"
               :to="getServerLink(server)"
             />
           </div>
@@ -212,13 +212,10 @@
               <td class="table-center-cell">
                 <div class="status-indicator table-status-indicator-inline" :style="{ background: getStatusColor(server) }"></div>
               </td>
-              <td><b class="table-server-name">{{ server.name }}</b></td>
+              <td><b class="table-server-name" :title="server.name">{{ server.name }}</b></td>
               <td>
-                <span v-if="server.region && server.region !== 'xx'" class="country-os-icons">
-                  <img :src="getPublicAssetUrl('flags/' + getFlagRegionCode(server.region) + '.svg')" :alt="server.region" class="flag-img">
-                </span>
-                <span v-else class="country-os-icons">
-                  <span class="flag-fallback">🏳️</span>
+                <span class="country-os-icons">
+                  <RegionFlag :region="server.region" />
                 </span>
                 {{ (server.region || 'XX').toUpperCase() }}
               </td>
@@ -231,33 +228,33 @@
               <td>
                 <div class="table-stat">
                   <div class="stat-bar-container stat-bar-small table-usage-bar">
-                  <div class="stat-bar-fill" :style="{ width: (parseFloat(server.cpu) || 0) + '%', background: getUsageColor(parseFloat(server.cpu) || 0) }"></div>
-                </div>
-                  <span>{{ (parseFloat(server.cpu) || 0).toFixed(1) }}%</span>
+                    <div class="stat-bar-fill" :style="{ width: getTableCpuPercent(server) + '%', background: getUsageColor(getTableCpuPercent(server)) }"></div>
+                  </div>
+                  <span>{{ getTableCpuPercent(server).toFixed(1) }}%</span>
                 </div>
               </td>
               <td>
                 <div class="table-stat">
                   <div class="stat-bar-container table-usage-bar">
-                    <div class="stat-bar-fill" :style="{ width: (server.ram_total > 0 ? ((server.ram_used / server.ram_total) * 100).toFixed(2) : 0) + '%', background: getUsageColor(server.ram_total > 0 ? ((server.ram_used / server.ram_total) * 100) : 0) }"></div>
+                    <div class="stat-bar-fill" :style="{ width: getTableRamPercent(server) + '%', background: getUsageColor(getTableRamPercent(server)) }"></div>
                   </div>
-                  <span>{{ server.ram_total > 0 ? ((server.ram_used / server.ram_total) * 100).toFixed(2) : '0.00' }}%</span>
+                  <span>{{ getTableRamPercent(server).toFixed(2) }}%</span>
                 </div>
               </td>
               <td>
                 <div class="table-stat">
                   <div class="stat-bar-container table-usage-bar">
-                    <div class="stat-bar-fill" :style="{ width: (server.disk_total > 0 ? ((server.disk_used / server.disk_total) * 100).toFixed(2) : 0) + '%', background: getUsageColor(server.disk_total > 0 ? ((server.disk_used / server.disk_total) * 100) : 0) }"></div>
+                    <div class="stat-bar-fill" :style="{ width: getTableDiskPercent(server) + '%', background: getUsageColor(getTableDiskPercent(server)) }"></div>
                   </div>
-                  <span>{{ server.disk_total > 0 ? ((server.disk_used / server.disk_total) * 100).toFixed(2) : '0.00' }}%</span>
+                  <span>{{ getTableDiskPercent(server).toFixed(2) }}%</span>
                 </div>
               </td>
-              <td v-if="sysConfig.show_tf && server.traffic_limit">
+              <td v-if="sysConfig.show_tf && Number(server.traffic_limit) > 0">
                 <div class="table-stat">
-                    <div class="stat-bar-container stat-bar-small table-usage-bar">
-                    <div class="stat-bar-fill" :style="{ width: Math.min(100, calcTrafficUsagePercent(server)) + '%', background: getUsageColor(calcTrafficUsagePercent(server)) }"></div>
+                  <div class="stat-bar-container stat-bar-small table-usage-bar">
+                    <div class="stat-bar-fill" :style="{ width: clampPercent(calcTrafficUsagePercent(server)) + '%', background: getUsageColor(calcTrafficUsagePercent(server)) }"></div>
                   </div>
-                  <span>{{ calcTrafficUsagePercent(server).toFixed(1) }}%</span>
+                  <span :title="formatTrafficPercentFullTitle(calcTrafficUsagePercent(server), 1) || undefined">{{ formatTrafficPercentNumber(calcTrafficUsagePercent(server), 1) }}%</span>
                 </div>
               </td>
               <td v-else>-</td>
@@ -282,14 +279,14 @@
 
     <div v-if="!isLoading && sitesRemaining > 0" class="loading-more">
       <div class="loading-spinner-small"></div>
-      <span>Loading remaining sites... ({{ sitesRemaining }})</span>
+      <span>{{ trans.loadingRemainingSites }} ({{ sitesRemaining }})</span>
     </div>
 
-    <div v-if="hasCorsError" class="modal-overlay active">
+    <div v-if="hasCorsError" class="modal-overlay active" role="dialog" aria-modal="true" aria-label="cors error">
       <div class="modal-dialog">
         <div class="modal-header">
           <div class="modal-title">$ cors --error</div>
-          <button class="modal-close" @click="hasCorsError = null">✕</button>
+          <button type="button" class="modal-close" @click="hasCorsError = null">✕</button>
         </div>
         <div v-for="site in hasCorsError" :key="site" class="danger-box mb-4">
           <div class="flex-center-gap-sm">
@@ -297,16 +294,16 @@
           </div>
         </div>
         <div class="modal-footer flex-justify-end">
-          <button @click="hasCorsError = null" class="btn">OK</button>
+          <button type="button" @click="hasCorsError = null" class="btn">OK</button>
         </div>
       </div>
     </div>
 
-    <div v-if="financeModalOpen" class="modal-overlay active" @click.self="financeModalOpen = false">
+    <div v-if="financeModalOpen" class="modal-overlay active" role="dialog" aria-modal="true" aria-label="finance summary" @click.self="financeModalOpen = false">
       <div class="modal-dialog finance-modal-dialog">
         <div class="modal-header">
           <div class="modal-title">$ finance --summary</div>
-          <button class="modal-close" @click="financeModalOpen = false">✕</button>
+          <button type="button" class="modal-close" @click="financeModalOpen = false">✕</button>
         </div>
 
         <div class="finance-summary-grid">
@@ -371,9 +368,17 @@ import ServerBarCard from '../components/ServerBarCard.vue'
 import ServerRingCard from '../components/ServerRingCard.vue'
 import Footer from '../components/Footer.vue'
 import OsIcon from '../components/OsIcon.vue'
+import RegionFlag from '../components/RegionFlag.vue'
 import LiveConnectionTimeoutModal from '../components/LiveConnectionTimeoutModal.vue'
 import { fetchConfig, fetchServersAll, fetchServersAllWithProgress, formatBytes, createLiveSocket, getFlagRegionCode, isServerOnline, normalizeLiveSocketTimeoutMinutes } from '../utils/api.js'
-import { calcTrafficUsagePercent, getUsageColor } from '../composables/useServerCardData'
+import {
+  calcTrafficUsagePercent,
+  clampPercent,
+  formatTrafficPercentFullTitle,
+  formatTrafficPercentNumber,
+  getUsageColor,
+  safeUsagePercent
+} from '../composables/useServerCardData'
 import { getTitle, hasMultipleApiBases, getApiBases, getPublicAssetUrl } from '../utils/config'
 import { currentLang, useTranslation } from '../utils/i18n.js'
 import { TIME, DEFAULT_SITE_TITLE, STORAGE, LATENCY_WINDOW } from '../utils/constants'
@@ -381,6 +386,9 @@ import { normalizeTimestamp as normalizeMetricTimestamp } from '../utils/time.js
 import { normalizeDashboardView, normalizeDisplayMode, resolveDisplayMode } from '../utils/displayMode.js'
 import { getPlaybackElapsedMs, resolvePlaybackCursor } from '../utils/playback.js'
 import { getMikusAssetUrl, isMikusThemeEnabled, normalizeThemeOptions, setMikusThemeClass } from '../utils/themeOptions.js'
+import { BUILTIN_PING_NODE_DEFAULTS, resolveLocalizedPingName } from '../utils/pingNode.js'
+import { getActiveModalCount, useModal } from '../composables/useModal.js'
+import { safeLocalStorage, safeSessionStorage } from '../utils/storage.js'
 import {
   CURRENCY_SYMBOLS,
   DEFAULT_EXCHANGE_RATES,
@@ -391,8 +399,16 @@ import {
   getDailyExchangeRates,
   getStoredFinanceCurrency,
   normalizeFinanceCurrency,
+  resolveFinanceNumberLocale,
   setStoredFinanceCurrency
 } from '../utils/finance.js'
+
+const DASHBOARD_FILTER_SESSION_KEY = 'cfsm_dashboard_region_filter'
+
+const readInitialFilter = () => {
+  const saved = String(safeSessionStorage.getItem(DASHBOARD_FILTER_SESSION_KEY) || '').trim().toLowerCase()
+  return saved || 'all'
+}
 
 const servers = ref([])
 const stats = ref({ total: '-', online: 0, offline: 0, globalNetRx: 0, globalNetTx: 0, globalSpeedIn: 0, globalSpeedOut: 0 })
@@ -422,7 +438,7 @@ const sysConfig = ref({
 })
 const regionStats = ref({})
 const currentView = ref('bar')
-const currentFilter = ref('all')
+const currentFilter = ref(readInitialFilter())
 const filterWrap = ref(null)
 const filterMeasure = ref(null)
 const filterMoreMeasure = ref(null)
@@ -444,6 +460,22 @@ const router = useRouter()
 const trans = useTranslation()
 const financeRateCurrencies = DISPLAY_FINANCE_CURRENCIES
 const isMikusTheme = computed(() => isMikusThemeEnabled(sysConfig.value.theme_options))
+
+const localizedSysConfig = computed(() => ({
+  ...sysConfig.value,
+  custom_ct_name: resolveLocalizedPingName(sysConfig.value.custom_ct_name, BUILTIN_PING_NODE_DEFAULTS.ct, trans.value.pingCt || 'CT'),
+  custom_cu_name: resolveLocalizedPingName(sysConfig.value.custom_cu_name, BUILTIN_PING_NODE_DEFAULTS.cu, trans.value.pingCu || 'CU'),
+  custom_cm_name: resolveLocalizedPingName(sysConfig.value.custom_cm_name, BUILTIN_PING_NODE_DEFAULTS.cm, trans.value.pingCm || 'CM'),
+  custom_bd_name: resolveLocalizedPingName(sysConfig.value.custom_bd_name, BUILTIN_PING_NODE_DEFAULTS.bd, trans.value.pingBd || 'BGP'),
+  node_1_name: resolveLocalizedPingName(sysConfig.value.node_1_name, BUILTIN_PING_NODE_DEFAULTS.node_1, trans.value.pingNode_1 || 'Node 1'),
+  node_2_name: resolveLocalizedPingName(sysConfig.value.node_2_name, BUILTIN_PING_NODE_DEFAULTS.node_2, trans.value.pingNode_2 || 'Node 2'),
+  node_3_name: resolveLocalizedPingName(sysConfig.value.node_3_name, BUILTIN_PING_NODE_DEFAULTS.node_3, trans.value.pingNode_3 || 'Node 3'),
+  node_4_name: resolveLocalizedPingName(sysConfig.value.node_4_name, BUILTIN_PING_NODE_DEFAULTS.node_4, trans.value.pingNode_4 || 'Node 4')
+}))
+
+const getTableCpuPercent = (server) => clampPercent(server?.cpu)
+const getTableRamPercent = (server) => safeUsagePercent(server?.ram_used, server?.ram_total, true)
+const getTableDiskPercent = (server) => safeUsagePercent(server?.disk_used, server?.disk_total, true)
 
 const mikusAsset = (filename) => getMikusAssetUrl(filename)
 
@@ -469,17 +501,21 @@ const financeSummaryItems = computed(() => [
 ])
 
 const exchangeRateRows = computed(() => {
-  const baseRate = exchangeRates.value[financeCurrency.value] || DEFAULT_EXCHANGE_RATES[financeCurrency.value] || 1
+  const rawBase = Number(exchangeRates.value[financeCurrency.value] ?? DEFAULT_EXCHANGE_RATES[financeCurrency.value] ?? 1)
+  const baseRate = Number.isFinite(rawBase) && rawBase > 0 ? rawBase : 1
+  const locale = resolveFinanceNumberLocale(currentLang.value)
   return financeRateCurrencies.map(currency => {
-    const targetRate = exchangeRates.value[currency] || DEFAULT_EXCHANGE_RATES[currency] || 1
-    const rate = targetRate / baseRate
+    const rawTarget = Number(exchangeRates.value[currency] ?? DEFAULT_EXCHANGE_RATES[currency] ?? 1)
+    const targetRate = Number.isFinite(rawTarget) && rawTarget > 0 ? rawTarget : 1
+    const rawRatio = targetRate / baseRate
+    const safeRate = Number.isFinite(rawRatio) && rawRatio >= 0 ? rawRatio : 0
     return {
       currency,
       targetSymbol: CURRENCY_SYMBOLS[currency] || '',
-      rate: new Intl.NumberFormat('zh-CN', {
+      rate: new Intl.NumberFormat(locale, {
         maximumFractionDigits: 6,
         minimumFractionDigits: 6
-      }).format(rate)
+      }).format(safeRate)
     }
   })
 })
@@ -495,7 +531,11 @@ const financeRateSourceText = computed(() => {
 })
 
 const formatFinanceMetric = (amountCNY) => {
-  return formatFinanceAmount(convertCnyAmount(amountCNY, financeCurrency.value, exchangeRates.value), financeCurrency.value)
+  return formatFinanceAmount(
+    convertCnyAmount(amountCNY, financeCurrency.value, exchangeRates.value),
+    financeCurrency.value,
+    currentLang.value
+  )
 }
 
 const setFinanceCurrency = (event) => {
@@ -662,19 +702,29 @@ const currentCardComponent = computed(() => currentView.value === 'ring' ? Serve
 const switchView = (viewName) => {
   const normalizedView = normalizeDashboardView(viewName, sysConfig.value.display_mode)
   currentView.value = normalizedView
-  localStorage.setItem(STORAGE.VIEW_PREFERENCE, normalizedView)
-  if (normalizedView === 'map' && !mapInitialized.value) {
-    initMap()
-    mapInitialized.value = true
-  } else if (normalizedView === 'map' && window.myMap) {
-    setTimeout(() => window.myMap.invalidateSize(), 100)
+  safeLocalStorage.setItem(STORAGE.VIEW_PREFERENCE, normalizedView)
+  if (normalizedView === 'map') {
+    if (window.myMap) {
+      setTimeout(() => window.myMap?.invalidateSize(), 100)
+    } else if (!mapInitialized.value) {
+      initMap()
+    }
   }
 }
 
 const setFilter = (code) => {
-  const nextFilter = code.toLowerCase()
+  const nextFilter = String(code || 'all').toLowerCase()
   currentFilter.value = currentFilter.value === nextFilter ? 'all' : nextFilter
+  safeSessionStorage.setItem(DASHBOARD_FILTER_SESSION_KEY, currentFilter.value)
   filterMoreOpen.value = false
+}
+
+const reconcileSavedFilter = () => {
+  if (currentFilter.value === 'all' || servers.value.length === 0) return
+  if (filteredServers.value.length === 0) {
+    currentFilter.value = 'all'
+    safeSessionStorage.setItem(DASHBOARD_FILTER_SESSION_KEY, 'all')
+  }
 }
 
 const getStatusColor = (server) => {
@@ -899,15 +949,31 @@ const applyPlaybackSamples = () => {
 
 const advanceServerClocks = () => {
   const currentTs = now.value
-  servers.value = servers.value.map(server => {
+  // 就地更新计时字段而非每秒 map 重建全部对象：数组与对象引用保持稳定，
+  // filter/group 等依赖数组身份的 computed 不会每秒失效，
+  // 卡片组件的依赖精确跟踪到 display_timestamp 等具体字段
+  for (const server of servers.value) {
     const reportTs = getServerReportTimestamp(server, null)
     const isOnline = reportTs && (currentTs - reportTs) < TIME.ONLINE_THRESHOLD_MS
     const currentDisplayTs = getServerDisplayTimestamp(server) || getServerSampleTimestamp(server) || reportTs
     const elapsedMs = getPlaybackElapsedMs(currentTs, server.current_timestamp, PLAYBACK_TICK_MS)
     const nextDisplayTs = isOnline && currentDisplayTs ? currentDisplayTs + elapsedMs : currentDisplayTs
-    return withDisplayTiming(server, nextDisplayTs, currentTs)
-  })
+    server.current_timestamp = currentTs
+    if (reportTs) {
+      server.report_timestamp = reportTs
+      server.last_updated = reportTs
+    }
+    if (!nextDisplayTs) continue
+    server.sample_timestamp = getServerSampleTimestamp(server) || nextDisplayTs || reportTs
+    server.display_timestamp = nextDisplayTs
+    server.sample_lag_seconds = Math.max(0, Math.floor((nextDisplayTs - (server.sample_timestamp || reportTs || nextDisplayTs)) / 1000))
+  }
   applyPlaybackSamples()
+}
+
+const toSafePositiveNumber = (value) => {
+  const num = Number(value)
+  return Number.isFinite(num) && num > 0 ? num : 0
 }
 
 const recomputeStats = (currentTs = Date.now()) => {
@@ -917,17 +983,18 @@ const recomputeStats = (currentTs = Date.now()) => {
   const regionCounts = {}
   let unknownCount = 0
   for (const s of list) {
-    const ts = new Date(s.last_updated || 0).getTime()
+    const ts = normalizeMetricTimestamp(s.report_timestamp ?? s.last_updated, 0)
     const isOnline = ts && (currentTs - ts) < TIME.ONLINE_THRESHOLD_MS
     if (isOnline) {
       online++
-      speedIn += parseFloat(s.net_in_speed) || 0
-      speedOut += parseFloat(s.net_out_speed) || 0
+      speedIn += toSafePositiveNumber(s.net_in_speed)
+      speedOut += toSafePositiveNumber(s.net_out_speed)
     }
-    netRx += parseFloat(s.net_rx) || 0
-    netTx += parseFloat(s.net_tx) || 0
-    if (s.region) {
-      const key = String(s.region).toUpperCase()
+    netRx += toSafePositiveNumber(s.net_rx)
+    netTx += toSafePositiveNumber(s.net_tx)
+    const validFlag = getFlagRegionCode(s.region)
+    if (validFlag && validFlag !== 'xx') {
+      const key = String(s.region).trim().toUpperCase()
       regionCounts[key] = (regionCounts[key] || 0) + 1
     } else {
       unknownCount++
@@ -971,6 +1038,14 @@ const loadDashboardConfig = async () => {
     sysConfig.value = {
       ...sysConfig.value,
       site_title: hasMultipleApiBases() && localTitle ? localTitle : (siteTitle || sysConfig.value.site_title),
+      custom_ct_name: config?.custom_ct_name ?? sysConfig.value.custom_ct_name,
+      custom_cu_name: config?.custom_cu_name ?? sysConfig.value.custom_cu_name,
+      custom_cm_name: config?.custom_cm_name ?? sysConfig.value.custom_cm_name,
+      custom_bd_name: config?.custom_bd_name ?? sysConfig.value.custom_bd_name,
+      node_1_name: config?.node_1_name ?? sysConfig.value.node_1_name,
+      node_2_name: config?.node_2_name ?? sysConfig.value.node_2_name,
+      node_3_name: config?.node_3_name ?? sysConfig.value.node_3_name,
+      node_4_name: config?.node_4_name ?? sysConfig.value.node_4_name,
       display_mode: resolveDisplayMode(config),
       frontend_ws_timeout_minutes: normalizeLiveSocketTimeoutMinutes(config?.frontend_ws_timeout_minutes),
       theme_options: normalizeThemeOptions(config?.theme_options),
@@ -1177,12 +1252,33 @@ const handleVisibility = () => {
   }
 }
 
+let mapLoading = false
+let isDashboardUnmounted = false
+
 const initMap = () => {
+  if (mapInitialized.value || mapLoading || isDashboardUnmounted) return
+  mapLoading = true
   if (!window.L) {
+    const existingScript = document.querySelector('script[data-leaflet-js]')
+    if (existingScript) {
+      existingScript.addEventListener('load', () => loadLeafletCSS(), { once: true })
+      existingScript.addEventListener('error', () => {
+        mapLoading = false
+        mapInitialized.value = false
+        existingScript.remove()
+      }, { once: true })
+      return
+    }
     const script = document.createElement('script')
     script.src = getPublicAssetUrl('files/leaflet.js')
+    script.dataset.leafletJs = '1'
     script.onload = () => {
       loadLeafletCSS()
+    }
+    script.onerror = () => {
+      mapLoading = false
+      mapInitialized.value = false
+      script.remove()
     }
     document.head.appendChild(script)
   } else {
@@ -1191,30 +1287,79 @@ const initMap = () => {
 }
 
 const loadLeafletCSS = () => {
+  if (isDashboardUnmounted) {
+    mapLoading = false
+    return
+  }
+  // 防止重复进出地图视图时向 <head> 堆积重复的样式/脚本节点
+  if (document.querySelector('link[data-leaflet-css]')) {
+    createMap()
+    return
+  }
   const link = document.createElement('link')
   link.rel = 'stylesheet'
   link.href = getPublicAssetUrl('files/leaflet.css')
-  document.head.appendChild(link)
+  link.dataset.leafletCss = '1'
   link.onload = () => {
     createMap()
   }
+  link.onerror = () => {
+    mapLoading = false
+    mapInitialized.value = false
+    link.remove()
+  }
+  document.head.appendChild(link)
 }
 
 const isMobile = () => /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) || window.innerWidth < 768
 
+// world geojson 体积较大：缓存到模块级变量，避免反复进出地图视图重复下载
+let cachedWorldGeoJson = null
+
 const createMap = () => {
-  const mobileView = isMobile()
-  window.myMap = window.L.map('map-container', {
-    zoomControl: false,
-    attributionControl: false,
-    minZoom: mobileView ? 1 : 1
-  }).setView(mobileView ? [35, 105] : [30, 10], mobileView ? 1 : 2)
+  if (isDashboardUnmounted || !window.L) {
+    mapLoading = false
+    return
+  }
+  const containerEl = document.getElementById('map-container')
+  if (!containerEl) {
+    mapLoading = false
+    return
+  }
+  if (window.myMap) {
+    mapInitialized.value = true
+    mapLoading = false
+    drawMarkers()
+    return
+  }
+  try {
+    const mobileView = isMobile()
+    window.myMap = window.L.map(containerEl, {
+      zoomControl: false,
+      attributionControl: false,
+      minZoom: mobileView ? 1 : 1
+    }).setView(mobileView ? [35, 105] : [30, 10], mobileView ? 1 : 2)
 
-  window.L.control.zoom({ position: 'bottomright' }).addTo(window.myMap)
+    window.L.control.zoom({ position: 'bottomright' }).addTo(window.myMap)
+    mapInitialized.value = true
+    mapLoading = false
+    currentMapDataStr = ''
+  } catch (e) {
+    mapLoading = false
+    mapInitialized.value = false
+    console.error('[ERROR] Map init failed', e)
+    return
+  }
 
+  if (cachedWorldGeoJson) {
+    window.worldGeoJson = cachedWorldGeoJson
+    drawMarkers()
+    return
+  }
   fetch(getPublicAssetUrl('files/world.zh.json'))
     .then(res => res.json())
     .then(worldGeoJson => {
+      cachedWorldGeoJson = worldGeoJson
       window.worldGeoJson = worldGeoJson
       drawMarkers()
     })
@@ -1236,14 +1381,17 @@ const regionCoords = {
 let markersLayer, geoJsonLayer, currentMapDataStr = ""
 
 const getThemeColors = () => {
-  const isLight = document.body.classList.contains('light')
+  const isLight = typeof document !== 'undefined' && document.body.classList.contains('light')
   return {
-    bgPrimary: isLight ? '#0a0e14' : '#0a0e14',
+    isLight,
+    bgPrimary: isLight ? '#f5f5f0' : '#0a0e14',
     bgSecondary: isLight ? '#e8e8e0' : '#12171f',
-    borderColor: isLight ? '#1e2a3a' : '#1e2a3a',
-    accentGreen: isLight ? '#00d4aa' : '#00d4aa',
-    colorBlack: isLight ? '#000' : '#000',
-    colorWhite: isLight ? '#fff' : '#fff'
+    landFill: isLight ? '#d6d8ce' : '#1e2a3a',
+    borderColor: isLight ? '#a8aca0' : '#0a0e14',
+    accentGreen: isLight ? '#16a374' : '#00d4aa',
+    markerText: isLight ? '#ffffff' : '#000000',
+    colorBlack: isLight ? '#1f2937' : '#000000',
+    colorWhite: '#ffffff'
   }
 }
 
@@ -1272,54 +1420,68 @@ const drawMarkers = () => {
     style: function(feature) {
       const isActive = activeIso2[feature.properties.iso_a2]
       return {
-        fillColor: isActive ? colors.accentGreen : colors.borderColor,
+        fillColor: isActive ? colors.accentGreen : colors.landFill,
         weight: 1,
-        opacity: 0.8,
-        color: colors.bgPrimary,
-        fillOpacity: isActive ? 0.4 : 0.2
+        opacity: 0.85,
+        color: colors.borderColor,
+        fillOpacity: isActive ? (colors.isLight ? 0.55 : 0.4) : (colors.isLight ? 0.65 : 0.2)
       }
     }
   }).addTo(window.myMap)
 
   for (const [code, count] of Object.entries(regionStats.value)) {
     const upperCode = code.toUpperCase()
-    if (regionCoords[upperCode]) {
+    const safeCount = Math.max(0, Number.parseInt(count, 10) || 0)
+    if (safeCount > 0 && regionCoords[upperCode]) {
       const icon = window.L.divIcon({
         className: 'custom-map-marker',
-        html: `<div style="background:${colors.accentGreen}; color:${colors.colorBlack}; border-radius:50%; width:22px; height:22px; display:flex; align-items:center; justify-content:center; font-size:10px; font-weight:bold; border:2px solid ${colors.bgPrimary}; box-shadow:0 0 10px ${colors.accentGreen}80; font-family:JetBrains Mono,monospace;">${count}</div>`,
-        iconSize: [22,22]
+        html: `<div style="background:${colors.accentGreen}; color:${colors.markerText}; border-radius:999px; min-width:22px; height:22px; padding:0 5px; box-sizing:border-box; display:inline-flex; align-items:center; justify-content:center; font-size:10px; font-weight:bold; white-space:nowrap; border:2px solid ${colors.bgPrimary}; box-shadow:0 0 10px ${colors.accentGreen}80; font-family:JetBrains Mono,monospace;">${safeCount}</div>`,
+        iconSize: null
       })
-      window.L.marker(regionCoords[upperCode], {icon: icon}).addTo(markersLayer)
+      window.L.marker(regionCoords[upperCode], { icon }).addTo(markersLayer)
     }
   }
 }
 
 const getServerLink = (server) => {
+  // server.id 可能含路由特殊字符（?#& 等），统一 encodeURIComponent（与 admin 侧一致）
   const bases = getApiBases()
-  if (bases.length === 0) return `/server/${server.id}`
+  if (bases.length === 0) return `/server/${encodeURIComponent(server.id)}`
   
   const apiIndex = bases.indexOf(server.source)
-  if (apiIndex === -1 || apiIndex === 0) return `/server/${server.id}`
+  if (apiIndex === -1 || apiIndex === 0) return `/server/${encodeURIComponent(server.id)}`
   
-  return `/server/${server.id}?apiIndex=${apiIndex}`
+  return `/server/${encodeURIComponent(server.id)}?apiIndex=${apiIndex}`
 }
 
 const goToServer = (server) => {
   router.push(getServerLink(server))
 }
 
+useModal(() => Boolean(hasCorsError.value), () => { hasCorsError.value = null })
+useModal(financeModalOpen, () => { financeModalOpen.value = false })
+
+const handleGlobalKeydown = (event) => {
+  if (event.key !== 'Escape' || event.defaultPrevented || getActiveModalCount() > 0) return
+  if (filterMoreOpen.value) {
+    filterMoreOpen.value = false
+  }
+}
+
 onMounted(async () => {
+  isDashboardUnmounted = false
   financeCurrency.value = getStoredFinanceCurrency()
   loadFinanceRates()
 
   await loadDashboardConfig()
-  const rawSavedView = localStorage.getItem(STORAGE.VIEW_PREFERENCE)
+  const rawSavedView = safeLocalStorage.getItem(STORAGE.VIEW_PREFERENCE)
   const savedView = normalizeDashboardView(rawSavedView, sysConfig.value.display_mode)
   currentView.value = savedView
   if (rawSavedView && rawSavedView !== savedView) {
-    localStorage.setItem(STORAGE.VIEW_PREFERENCE, savedView)
+    safeLocalStorage.setItem(STORAGE.VIEW_PREFERENCE, savedView)
   }
   await refreshData()
+  reconcileSavedFilter()
   await nextTick()
   scheduleFilterMeasurement()
   if (window.ResizeObserver && filterWrap.value) {
@@ -1329,6 +1491,7 @@ onMounted(async () => {
     window.addEventListener('resize', scheduleFilterMeasurement)
   }
   document.addEventListener('click', closeFilterMoreOnOutsideClick)
+  window.addEventListener('keydown', handleGlobalKeydown)
   startLiveSocket()
   document.addEventListener('visibilitychange', handleVisibility)
 
@@ -1352,13 +1515,36 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  isDashboardUnmounted = true
+  mapLoading = false
+  mapInitialized.value = false
   document.removeEventListener('visibilitychange', handleVisibility)
   document.removeEventListener('click', closeFilterMoreOnOutsideClick)
+  window.removeEventListener('keydown', handleGlobalKeydown)
   window.removeEventListener('resize', scheduleFilterMeasurement)
   if (filterMeasureTimer) clearTimeout(filterMeasureTimer)
   if (filterResizeObserver) filterResizeObserver.disconnect()
   if (timeUpdateInterval) clearInterval(timeUpdateInterval)
   stopLiveSockets()
   if (themeObserver) themeObserver.disconnect()
+  // 销毁 Leaflet 实例：不清除会泄漏挂载在 window/document 上的事件监听
+  if (window.myMap) {
+    window.myMap.remove()
+    window.myMap = null
+  }
 })
 </script>
+
+<style scoped>
+.filter-tag :deep(.flag-img) {
+  width: 14px;
+  height: 10px;
+  object-fit: cover;
+  border-radius: 1px;
+}
+
+.filter-tag :deep(.flag-fallback) {
+  font-size: 12px;
+  line-height: 1;
+}
+</style>

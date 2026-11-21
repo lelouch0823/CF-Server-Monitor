@@ -1,9 +1,9 @@
 <template>
-  <div id="copyModal" class="modal-overlay" :class="{ active: show }">
+  <div id="copyModal" class="modal-overlay" :class="{ active: show }" role="dialog" aria-modal="true" :aria-label="currentServerName || trans.copy">
     <div class="modal-dialog">
       <div class="modal-header">
         <div class="modal-title">{{ currentServerName }}</div>
-        <button class="modal-close" @click="$emit('close')">✕</button>
+        <button type="button" class="modal-close" @click="$emit('close')">✕</button>
       </div>
 
       <div class="form-row">
@@ -111,38 +111,46 @@
           <span class="config-value">{{ formatWithUnit(txCorrection, 'GB') }}</span>
         </div>
         <div class="config-row">
-          <span class="config-label">{{ settings.custom_ct_name || trans.customCt }}</span>
+          <span class="config-label">{{ pingNodeLabel('custom_ct') }}</span>
           <span class="config-value">{{ isBlank(customCt) ? '-' : customCt }}</span>
         </div>
         <div class="config-row">
-          <span class="config-label">{{ settings.custom_cu_name || trans.customCu }}</span>
+          <span class="config-label">{{ pingNodeLabel('custom_cu') }}</span>
           <span class="config-value">{{ isBlank(customCu) ? '-' : customCu }}</span>
         </div>
         <div class="config-row">
-          <span class="config-label">{{ settings.custom_cm_name || trans.customCm }}</span>
+          <span class="config-label">{{ pingNodeLabel('custom_cm') }}</span>
           <span class="config-value">{{ isBlank(customCm) ? '-' : customCm }}</span>
         </div>
         <div class="config-row">
-          <span class="config-label">{{ settings.custom_bd_name || trans.customBd }}</span>
+          <span class="config-label">{{ pingNodeLabel('custom_bd') }}</span>
           <span class="config-value">{{ isBlank(customBd) ? '-' : customBd }}</span>
         </div>
         <div v-for="(node, index) in [node1, node2, node3, node4]" :key="index" class="config-row">
-          <span class="config-label">{{ settings[`node_${index + 1}_name`] || `Node ${index + 1}` }}</span><span class="config-value">{{ isBlank(node) ? '-' : node }}</span>
+          <span class="config-label">{{ pingNodeLabel(`node_${index + 1}`) }}</span>
+          <span class="config-value">{{ isBlank(node) ? '-' : node }}</span>
         </div>
       </div>
 
       <div class="form-group">
         <div class="cmd-output-wrapper" :class="{ copied: copiedCmd }">
           <span class="cmd-prompt">{{ targetOs === 'windows' ? 'PS' : '$' }}</span>
-          <pre class="cmd-output">{{ installCommand }}</pre>
+          <pre class="cmd-output">{{ showCommandSecret ? installCommand : maskedInstallCommand }}</pre>
+          <button
+            type="button"
+            class="password-toggle cmd-secret-toggle"
+            :aria-label="showCommandSecret ? trans.hideSecret : trans.showSecret"
+            :title="showCommandSecret ? trans.hideSecret : trans.showSecret"
+            @click="showCommandSecret = !showCommandSecret"
+          >{{ showCommandSecret ? '🙈' : '👁️' }}</button>
         </div>
       </div>
 
       <div class="modal-footer flex-justify-between">
         <div class="flex items-center gap-2">
-          <button @click="$emit('copy-cmd')" class="btn btn-primary">{{ copiedCmd ? '✅ ' + trans.copied : '📋 ' + trans.copy }}</button> &nbsp; <button @click="$emit('open-edit-from-copy')" class="btn btn-blue">✏️ {{ trans.edit }}</button>
+          <button type="button" @click="$emit('copy-cmd')" class="btn btn-primary">{{ copiedCmd ? '✅ ' + trans.copied : '📋 ' + trans.copy }}</button> &nbsp; <button type="button" @click="$emit('open-edit-from-copy')" class="btn btn-blue">✏️ {{ trans.edit }}</button>
         </div>
-        <button @click="$emit('close')" class="btn">{{ trans.cancel }}</button>
+        <button type="button" @click="$emit('close')" class="btn">{{ trans.cancel }}</button>
       </div>
     </div>
   </div>
@@ -151,6 +159,8 @@
 <script setup>
 import { computed, ref, watch } from 'vue'
 import HelpTooltip from '../../../components/HelpTooltip.vue'
+import { useModal } from '../../../composables/useModal.js'
+import { getLocalizedPingNodeLabel, maskCommandSecret } from '../../../utils/server.js'
 
 const props = defineProps({
   trans: { type: Object, required: true },
@@ -190,17 +200,23 @@ const emit = defineEmits([
   'update:install-version'
 ])
 
+useModal(() => props.show, () => emit('close'))
+
+const showCommandSecret = ref(false)
+const maskedInstallCommand = computed(() => maskCommandSecret(props.installCommand))
+const pingNodeLabel = (field) => getLocalizedPingNodeLabel(field, props.settings, props.trans)
+
 const CUSTOM_GH_PROXY_VALUE = '__custom__'
-const ghProxyOptions = [
+const ghProxyOptions = computed(() => [
   { value: '', label: props.trans.ghProxyPlaceholder || 'Direct' },
   { value: 'https://ghfast.top/', label: 'https://ghfast.top/' },
   { value: 'https://ghproxy.net/', label: 'https://ghproxy.net/' },
   { value: 'https://gh.llkk.cc/', label: 'https://gh.llkk.cc/' },
   { value: 'https://gh-proxy.com/', label: 'https://gh-proxy.com/' }
-]
+])
 
 const manualCustomGhProxy = ref(false)
-const isKnownGhProxy = (value) => ghProxyOptions.some(option => option.value === String(value || '').trim())
+const isKnownGhProxy = (value) => ghProxyOptions.value.some(option => option.value === String(value || '').trim())
 
 const selectedGhProxy = computed({
   get: () => {
@@ -233,7 +249,12 @@ const effectivePingMode = computed(() => (
 watch(
   () => props.show,
   (show) => {
-    if (show && isKnownGhProxy(props.installGhProxy)) {
+    if (!show) {
+      showCommandSecret.value = false
+      return
+    }
+    showCommandSecret.value = false
+    if (isKnownGhProxy(props.installGhProxy)) {
       manualCustomGhProxy.value = false
     }
   }

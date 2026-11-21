@@ -34,10 +34,12 @@ class FakeWebSocket {
 }
 
 test('frontend WebSocket closes at its lifetime limit without reconnecting', async () => {
+  const originalDisableMkcert = process.env.VITE_DISABLE_MKCERT
+  process.env.VITE_DISABLE_MKCERT = '1'
   const vite = await createServer({
     appType: 'custom',
     logLevel: 'silent',
-    server: { middlewareMode: true }
+    server: { middlewareMode: true, ws: false }
   })
   const { createLiveSocket, normalizeLiveSocketTimeoutMinutes } = await vite.ssrLoadModule('/src/frontend/utils/api.js')
   const originalWindow = globalThis.window
@@ -113,5 +115,10 @@ test('frontend WebSocket closes at its lifetime limit without reconnecting', asy
     globalThis.setTimeout = originalSetTimeout
     globalThis.clearTimeout = originalClearTimeout
     await vite.close()
+    if (originalDisableMkcert === undefined) {
+      delete process.env.VITE_DISABLE_MKCERT
+    } else {
+      process.env.VITE_DISABLE_MKCERT = originalDisableMkcert
+    }
   }
 })

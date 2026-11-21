@@ -264,7 +264,7 @@ test('legacy settings failure cannot replace a successful snapshot with partial 
   assert.equal(db.stats.writes, 0);
 });
 
-test('cold settings failures still use defaults without repeated reads and recover on forced refresh', async t => {
+test('cold settings failures return defaults without caching and recover on forced refresh', async t => {
   setup(t);
   t.mock.method(console, 'error', () => {});
   const db = makeDb(makeSettings());
@@ -272,13 +272,17 @@ test('cold settings failures still use defaults without repeated reads and recov
   const fallback = await loadSiteSettings(db);
   assert.equal(fallback.tg_notify, '0');
   assert.equal(fallback.tg_bot_token, '');
-  assert.equal(await loadSiteSettings(db), fallback);
-  assert.equal(db.stats.settings, 1);
+  // 冷启动失败不缓存残缺默认值（避免 jwt_secret 空窗口）：
+  // 下一次调用会重试 D1 读，并返回新的默认值对象而非缓存引用
+  const retried = await loadSiteSettings(db);
+  assert.equal(retried.tg_notify, '0');
+  assert.notEqual(retried, fallback);
+  assert.equal(db.stats.settings, 2);
   db.failSettings = false;
   const refreshed = await loadSiteSettings(db, { forceRefresh: true });
   assert.equal(refreshed.tg_notify, '2');
   assert.equal(refreshed.tg_bot_token, 'test-token');
-  assert.equal(db.stats.settings, 2);
+  assert.equal(db.stats.settings, 3);
   assert.equal(db.stats.writes, 0);
 });
 

@@ -3,15 +3,11 @@
     <div class="server-card-ring-header">
       <div class="server-card-header">
         <div class="server-identity">
-          <span v-if="regionCode && regionCode !== 'xx'" class="country-os-icons">
-            <img class="flag-img" :src="getPublicAssetUrl('flags/' + regionCode + '.svg')" :alt="regionCode">
+          <span class="country-os-icons">
+            <RegionFlag :region="server.region" />
             <OsIcon :os="server.os" />
           </span>
-          <span v-else class="country-os-icons">
-            <span class="flag-fallback">🏳️</span>
-            <OsIcon :os="server.os" />
-          </span>
-          <span class="server-name">{{ server.name }}</span>
+          <span class="server-name" :title="server.name">{{ server.name }}</span>
         </div>
         <span class="status-label" :style="{ color: statusColor, borderColor: statusColor }">{{ statusText }}</span>
       </div>
@@ -24,7 +20,17 @@
           </div>
         </div>
         <div class="card-badges">
-          <span v-for="(tag, index) in tagList" :key="tag" :class="['badge', 'badge-tag', tagColorClass(index)]">{{ tag }}</span>
+          <span
+            v-for="(tag, index) in visibleTagList"
+            :key="`${index}-${tag}`"
+            :title="tag"
+            :class="['badge', 'badge-tag', tagColorClass(index)]"
+          >{{ tag }}</span>
+          <span
+            v-if="hiddenTagCount > 0"
+            class="badge badge-tag badge-tag-more"
+            :title="tagList.join(', ')"
+          >+{{ hiddenTagCount }}</span>
           <span v-if="hasPublicIPv4 && hasPublicIPv6" class="badge badge-v4-v6">IPv4/6</span>
           <template v-else>
             <span v-if="hasPublicIPv4" class="badge badge-v4">IPv4</span>
@@ -44,7 +50,7 @@
           <span class="metric-ring-center">{{ roundedPercent(cpuPercent) }}%</span>
         </div>
         <div class="metric-ring-label">CPU</div>
-        <div class="metric-ring-subtext">{{ cpuCores }} Cores</div>
+        <div class="metric-ring-subtext">{{ cpuCores }} {{ trans.cores || 'Cores' }}</div>
       </div>
 
       <div class="metric-ring-item">
@@ -65,7 +71,7 @@
           </span>
         </div>
         <div class="metric-ring-label">RAM</div>
-        <div class="metric-ring-subtext">{{ ramUsageText }}</div>
+        <div class="metric-ring-subtext" :title="ramUsageText">{{ ramUsageText }}</div>
       </div>
 
       <div class="metric-ring-item">
@@ -75,7 +81,7 @@
           <span class="metric-ring-center">{{ roundedPercent(diskPercent) }}%</span>
         </div>
         <div class="metric-ring-label">Disk</div>
-        <div class="metric-ring-subtext">{{ diskUsageText }}</div>
+        <div class="metric-ring-subtext" :title="diskUsageText">{{ diskUsageText }}</div>
       </div>
     </div>
 
@@ -105,11 +111,11 @@
       <div v-if="sysConfig.show_tf" class="server-card-limit-section">
         <div class="server-card-limit-header">
           <span>{{ trans.monthlyTraffic }}</span>
-          <span>{{ trafficLimitText }}<template v-if="trafficLimitSummary"> | {{ trafficLimitPercentText }}%</template></span>
+          <span class="server-card-limit-summary" :title="trafficUsageFullTitle || trafficLimitText">{{ trafficLimitText }}<template v-if="trafficLimitSummary"> | {{ trafficLimitPercentText }}%</template></span>
         </div>
         <div class="server-card-limit-bar">
-          <div v-if="trafficLimitSummary" class="server-card-limit-fill" :style="{ width: Math.min(100, trafficUsagePercent) + '%', background: getUsageColor(trafficUsagePercent) }"></div>
-          <div v-else class="server-card-limit-fill" style="background-image: linear-gradient(to right, #00d4aa, #4da6ff, #ffb870, #f85149);">></div>
+          <div v-if="trafficLimitSummary" class="server-card-limit-fill" :style="{ width: trafficUsageBarWidth, background: getUsageColor(trafficUsagePercent) }"></div>
+          <div v-else class="server-card-limit-fill" style="width: 100%; background-image: linear-gradient(to right, #00d4aa, #4da6ff, #ffb870, #f85149);"></div>
         </div>
       </div>
       <ServerLatencyPanel
@@ -132,6 +138,7 @@
 
 <script setup>
 import OsIcon from './OsIcon.vue'
+import RegionFlag from './RegionFlag.vue'
 import ServerLatencyPanel from './ServerLatencyPanel.vue'
 import { DEFAULT_SERVER_CARD_CONFIG, useServerCardData } from '../composables/useServerCardData'
 
@@ -163,7 +170,9 @@ const {
   diskPercent,
   trafficLimitSummary,
   trafficUsagePercent,
+  trafficUsageBarWidth,
   trafficLimitPercentText,
+  trafficUsageFullTitle,
   trafficLimitText,
   netInSpeed,
   netOutSpeed,
@@ -187,8 +196,9 @@ const {
   hasPingData,
   threeNetDetails,
   hasThreeNetDetails,
-  getPublicAssetUrl,
   tagList,
+  visibleTagList,
+  hiddenTagCount,
   tagColorClass,
   hasPublicIPv4,
   hasPublicIPv6,
@@ -196,3 +206,77 @@ const {
   expireText
 } = useServerCardData(props)
 </script>
+
+<style scoped>
+.server-card {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.server-card-header {
+  gap: 8px;
+  min-width: 0;
+}
+
+.server-identity {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.country-os-icons {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.server-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.status-label {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.server-meta {
+  gap: 8px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.card-badges {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.badge-tag {
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.badge-tag-more {
+  background: rgba(128, 128, 128, 0.28);
+  color: var(--text-primary);
+}
+
+.metric-ring-subtext {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.server-card-limit-summary {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+</style>

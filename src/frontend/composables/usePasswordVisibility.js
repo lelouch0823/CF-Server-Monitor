@@ -8,19 +8,19 @@ export const usePasswordVisibility = (fields = []) => {
   })
 
   const toggle = (field) => {
-    if (visibility.hasOwnProperty(field)) {
+    if (Object.hasOwn(visibility, field)) {
       visibility[field] = !visibility[field]
     }
   }
 
   const show = (field) => {
-    if (visibility.hasOwnProperty(field)) {
+    if (Object.hasOwn(visibility, field)) {
       visibility[field] = true
     }
   }
 
   const hide = (field) => {
-    if (visibility.hasOwnProperty(field)) {
+    if (Object.hasOwn(visibility, field)) {
       visibility[field] = false
     }
   }
@@ -32,7 +32,7 @@ export const usePasswordVisibility = (fields = []) => {
   }
 
   const addField = (field) => {
-    if (!visibility.hasOwnProperty(field)) {
+    if (!Object.hasOwn(visibility, field)) {
       visibility[field] = false
     }
   }

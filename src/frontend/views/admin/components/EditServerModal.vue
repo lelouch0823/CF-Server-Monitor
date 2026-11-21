@@ -1,16 +1,17 @@
 <template>
-  <div id="editModal" class="modal-overlay" :class="{ active: show }">
+  <div id="editModal" class="modal-overlay" :class="{ active: show }" role="dialog" aria-modal="true" :aria-label="currentServerName || trans.editConf">
     <div class="modal-dialog edit-server-modal">
       <div class="modal-header">
         <div class="modal-title">{{ currentServerName }}</div>
-        <button class="modal-close" @click="$emit('close')">✕</button>
+        <button type="button" class="modal-close" :disabled="saving" @click="$emit('close')">✕</button>
       </div>
       <input type="hidden" v-model="editForm.id">
 
       <div class="form-row">
         <div class="form-group flex-1">
           <label class="form-label">{{ trans.hostnameLabel }} <span class="required">*</span></label>
-          <input type="text" name="edit_name" autocomplete="off" v-model="editForm.name" class="form-input" placeholder="e.g. My Server">
+          <input type="text" name="edit_name" autocomplete="off" maxlength="100" v-model="editForm.name" :class="['form-input', { 'input-invalid': fieldErrors.name }]" placeholder="e.g. My Server">
+          <p v-if="fieldErrors.name" class="text-red text-sm mt-1">{{ fieldErrors.name }}</p>
         </div>
 
         <div class="form-group flex-1">
@@ -45,7 +46,8 @@
 
         <div class="form-group flex-1">
           <label class="form-label">{{ trans.price }}</label>
-          <input type="text" name="edit_price" autocomplete="off" inputmode="decimal" v-model="editForm.price" class="form-input" placeholder="40.00" @blur="normalizePriceInput">
+          <input type="text" name="edit_price" autocomplete="off" inputmode="decimal" v-model="editForm.price" :class="['form-input', { 'input-invalid': fieldErrors.price }]" placeholder="40.00" @blur="normalizePriceInput">
+          <p v-if="fieldErrors.price" class="text-red text-sm mt-1">{{ fieldErrors.price }}</p>
         </div>
 
         <div class="form-group flex-1">
@@ -64,7 +66,8 @@
       <div class="form-row mobile-two-row">
         <div class="form-group flex-1">
           <label class="form-label">{{ trans.trafficLimit }} (GB)</label>
-          <input type="number" name="edit_traffic_limit" autocomplete="off" v-model="editForm.traffic_limit" class="form-input" placeholder="e.g. 1000" min="0" step="1">
+          <input type="text" inputmode="decimal" name="edit_traffic_limit" autocomplete="off" v-model="editForm.traffic_limit" :class="['form-input', { 'input-invalid': fieldErrors.traffic_limit }]" placeholder="e.g. 1000">
+          <p v-if="fieldErrors.traffic_limit" class="text-red text-sm mt-1">{{ fieldErrors.traffic_limit }}</p>
         </div>
         <div class="form-group flex-1">
           <label class="form-label">{{ trans.trafficCalcType }}</label>
@@ -90,7 +93,8 @@
             {{ trans.trafficAlertPercent }} (%)
             <HelpTooltip :text="trans.trafficAlertPercentTip" />
           </label>
-          <input type="number" name="edit_traffic_alert_percent" autocomplete="off" v-model="editForm.traffic_alert_percent" class="form-input" min="0" max="100" step="1">
+          <input type="text" inputmode="numeric" name="edit_traffic_alert_percent" autocomplete="off" v-model="editForm.traffic_alert_percent" :class="['form-input', { 'input-invalid': fieldErrors.traffic_alert_percent }]">
+          <p v-if="fieldErrors.traffic_alert_percent" class="text-red text-sm mt-1">{{ fieldErrors.traffic_alert_percent }}</p>
         </div>
       </div>
 
@@ -151,28 +155,31 @@
             {{ trans.networkInterface }}
             <HelpTooltip :text="trans.networkInterfaceHint" />
           </label>
-          <input type="text" name="edit_interface" autocomplete="off" v-model.trim="editForm.interface" class="form-input" placeholder="eth0">
+          <input type="text" name="edit_interface" autocomplete="off" v-model.trim="editForm.interface" :class="['form-input', { 'input-invalid': fieldErrors.interface }]" placeholder="eth0">
+          <p v-if="fieldErrors.interface" class="text-red text-sm mt-1">{{ fieldErrors.interface }}</p>
         </div>
         <div class="form-group flex-1">
           <label class="form-label">
             {{ trans.rxCorrection }} (GB)
             <HelpTooltip :text="trans.correctionHint" />
           </label>
-          <input type="number" name="edit_rx_correction" autocomplete="off" v-model="editForm.rx_correction" class="form-input" placeholder="0" min="0" step="0.1">
+          <input type="text" inputmode="decimal" name="edit_rx_correction" autocomplete="off" v-model="editForm.rx_correction" :class="['form-input', { 'input-invalid': fieldErrors.rx_correction }]" placeholder="0">
+          <p v-if="fieldErrors.rx_correction" class="text-red text-sm mt-1">{{ fieldErrors.rx_correction }}</p>
         </div>
         <div class="form-group flex-1">
           <label class="form-label">
             {{ trans.txCorrection }} (GB)
             <HelpTooltip :text="trans.correctionHint" />
           </label>
-          <input type="number" name="edit_tx_correction" autocomplete="off" v-model="editForm.tx_correction" class="form-input" placeholder="0" min="0" step="0.1">
+          <input type="text" inputmode="decimal" name="edit_tx_correction" autocomplete="off" v-model="editForm.tx_correction" :class="['form-input', { 'input-invalid': fieldErrors.tx_correction }]" placeholder="0">
+          <p v-if="fieldErrors.tx_correction" class="text-red text-sm mt-1">{{ fieldErrors.tx_correction }}</p>
         </div>
       </div>
 
       <div class="form-row">
         <div class="form-group flex-1">
           <label class="form-label">
-            {{ settings.custom_ct_name || trans.customCt }}
+            {{ pingNodeLabel('custom_ct') }}
             <HelpTooltip :text="trans.pingNodeTip" />
           </label>
           <input type="text" name="edit_custom_ct" autocomplete="off" v-model.trim="editForm.custom_ct" :class="['form-input', { 'input-invalid': pingNodeErrors.custom_ct }]" :placeholder="settings.custom_ct || 'gd-ct-dualstack.ip.zstaticcdn.com'">
@@ -180,7 +187,7 @@
         </div>
         <div class="form-group flex-1">
           <label class="form-label">
-            {{ settings.custom_cu_name || trans.customCu }}
+            {{ pingNodeLabel('custom_cu') }}
             <HelpTooltip :text="trans.pingNodeTip" />
           </label>
           <input type="text" name="edit_custom_cu" autocomplete="off" v-model.trim="editForm.custom_cu" :class="['form-input', { 'input-invalid': pingNodeErrors.custom_cu }]" :placeholder="settings.custom_cu || 'gd-cu-dualstack.ip.zstaticcdn.com'">
@@ -190,7 +197,7 @@
       <div class="form-row">
         <div class="form-group flex-1">
           <label class="form-label">
-            {{ settings.custom_cm_name || trans.customCm }}
+            {{ pingNodeLabel('custom_cm') }}
             <HelpTooltip :text="trans.pingNodeTip" />
           </label>
           <input type="text" name="edit_custom_cm" autocomplete="off" v-model.trim="editForm.custom_cm" :class="['form-input', { 'input-invalid': pingNodeErrors.custom_cm }]" :placeholder="settings.custom_cm || 'gd-cm-dualstack.ip.zstaticcdn.com'">
@@ -198,7 +205,7 @@
         </div>
         <div class="form-group flex-1">
           <label class="form-label">
-            {{ settings.custom_bd_name || trans.customBd }}
+            {{ pingNodeLabel('custom_bd') }}
             <HelpTooltip :text="trans.pingNodeTip" />
           </label>
           <input type="text" name="edit_custom_bd" autocomplete="off" v-model.trim="editForm.custom_bd" :class="['form-input', { 'input-invalid': pingNodeErrors.custom_bd }]" :placeholder="settings.custom_bd || 'ip.zstaticcdn.com'">
@@ -206,9 +213,9 @@
         </div>
       </div>
       <div class="form-row">
-        <div v-for="(field, index) in ['node_1', 'node_2']" :key="field" class="form-group flex-1">
+        <div v-for="field in ['node_1', 'node_2']" :key="field" class="form-group flex-1">
           <label class="form-label">
-            {{ settings[`${field}_name`] || `Node ${index + 1}` }}
+            {{ pingNodeLabel(field) }}
             <HelpTooltip :text="trans.pingNodeTip" />
           </label>
           <input type="text" :name="`edit_${field}`" autocomplete="off" v-model.trim="editForm[field]" :class="['form-input', { 'input-invalid': pingNodeErrors[field] }]" :placeholder="settings[field] || 'host[:port] / [IPv6]:port'">
@@ -216,9 +223,9 @@
         </div>
       </div>
       <div class="form-row">
-        <div v-for="(field, index) in ['node_3', 'node_4']" :key="field" class="form-group flex-1">
+        <div v-for="field in ['node_3', 'node_4']" :key="field" class="form-group flex-1">
           <label class="form-label">
-            {{ settings[`${field}_name`] || `Node ${index + 3}` }}
+            {{ pingNodeLabel(field) }}
             <HelpTooltip :text="trans.pingNodeTip" />
           </label>
           <input type="text" :name="`edit_${field}`" autocomplete="off" v-model.trim="editForm[field]" :class="['form-input', { 'input-invalid': pingNodeErrors[field] }]" :placeholder="settings[field] || 'host[:port] / [IPv6]:port'">
@@ -228,8 +235,8 @@
       <div class="form-row">
         <div class="form-group flex-1">
           <div class="checkbox-item no-margin">
-            <input type="checkbox" v-model="editForm.auto_renewal">
-            <label>
+            <input id="edit_auto_renewal" type="checkbox" v-model="editForm.auto_renewal">
+            <label for="edit_auto_renewal">
               <b>{{ trans.autoRenewal }}</b>
             </label>
           </div>
@@ -237,8 +244,8 @@
 
         <div class="form-group">
           <div class="checkbox-item no-margin">
-            <input type="checkbox" :checked="editForm.auto_update" @change="handleAutoUpdateChange">
-            <label>
+            <input id="edit_auto_update" type="checkbox" :checked="editForm.auto_update" @change="handleAutoUpdateChange">
+            <label for="edit_auto_update">
               <b>{{ trans.autoUpdate }}</b>
             </label>
           </div>
@@ -246,8 +253,8 @@
 
         <div class="form-group">
           <div class="checkbox-item no-margin">
-            <input type="checkbox" v-model="editForm.is_hidden">
-            <label>
+            <input id="edit_is_hidden" type="checkbox" v-model="editForm.is_hidden">
+            <label for="edit_is_hidden">
               <b>{{ trans.hideFromPublic }}</b>
             </label>
           </div>
@@ -255,16 +262,16 @@
 
         <div v-if="hasNodeNotificationOptions" class="form-group">
           <div class="checkbox-item no-margin">
-            <input type="checkbox" v-model="editForm.offline_notify_disabled">
-            <label>
+            <input id="edit_offline_notify_disabled" type="checkbox" v-model="editForm.offline_notify_disabled">
+            <label for="edit_offline_notify_disabled">
               <b>{{ trans.disableOfflineNotify }}</b>
             </label>
           </div>
         </div>
       </div>
       <div class="modal-footer flex-justify-between">
-        <button @click="$emit('save')" class="btn btn-primary" :disabled="hasPingNodeErrors">{{ trans.save }}</button>
-        <button @click="$emit('close')" class="btn">{{ trans.cancel }}</button>
+        <button type="button" @click="$emit('save')" class="btn btn-primary" :disabled="saving || hasValidationErrors">{{ saving ? trans.saving : trans.save }}</button>
+        <button type="button" @click="$emit('close')" class="btn" :disabled="saving">{{ trans.cancel }}</button>
       </div>
     </div>
   </div>
@@ -273,9 +280,22 @@
 <script setup>
 import { computed, watch } from 'vue'
 import HelpTooltip from '../../../components/HelpTooltip.vue'
+import { useModal } from '../../../composables/useModal.js'
 import { PING_NODE_FIELDS, validatePingNode } from '../../../utils/pingNode.js'
 import { currentLang } from '../../../utils/i18n.js'
-import { BILLING_CYCLES, CURRENCY_OPTIONS, getLocalizedOptionField, normalizePrice, renewExpireDateIfNeeded } from '../../../utils/server.js'
+import {
+  BILLING_CYCLES,
+  CURRENCY_OPTIONS,
+  getLocalizedOptionField,
+  getLocalizedPingNodeLabel,
+  renewExpireDateIfNeeded,
+  validateNetworkInterfaceInput,
+  validatePriceInput,
+  validateServerNameInput,
+  validateTrafficAlertPercentInput,
+  validateTrafficCorrectionInput,
+  validateTrafficLimitInput
+} from '../../../utils/server.js'
 
 const editForm = defineModel('editForm', { type: Object, required: true })
 
@@ -283,8 +303,17 @@ const props = defineProps({
   trans: { type: Object, required: true },
   show: { type: Boolean, default: false },
   currentServerName: { type: String, default: '' },
-  settings: { type: Object, required: true }
+  settings: { type: Object, required: true },
+  saving: { type: Boolean, default: false }
 })
+
+const emit = defineEmits(['save', 'close', 'toggle-auto-update'])
+
+useModal(() => props.show, () => emit('close'), {
+  canClose: () => !props.saving
+})
+
+const pingNodeLabel = (field) => getLocalizedPingNodeLabel(field, props.settings, props.trans)
 
 const pingNodeErrorMessage = computed(() => (
   props.trans.invalidPingNodeFormat || 'Use domain, IPv4, or host:port. Port must be 1-65535.'
@@ -297,7 +326,20 @@ const pingNodeErrors = computed(() => Object.fromEntries(
   ])
 ))
 
+const fieldErrors = computed(() => ({
+  name: validateServerNameInput(editForm.value.name).valid ? '' : (props.trans.invalidServerName || 'Invalid server name'),
+  price: validatePriceInput(editForm.value.price).valid ? '' : (props.trans.invalidPrice || 'Invalid price'),
+  traffic_limit: validateTrafficLimitInput(editForm.value.traffic_limit).valid ? '' : (props.trans.invalidTrafficLimit || 'Invalid traffic limit'),
+  traffic_alert_percent: validateTrafficAlertPercentInput(editForm.value.traffic_alert_percent).valid ? '' : (props.trans.invalidTrafficAlertPercent || 'Invalid threshold'),
+  interface: validateNetworkInterfaceInput(editForm.value.interface).valid ? '' : (props.trans.invalidNetworkInterface || 'Invalid network interface'),
+  rx_correction: validateTrafficCorrectionInput(editForm.value.rx_correction).valid ? '' : (props.trans.invalidTrafficCorrection || 'Invalid traffic correction'),
+  tx_correction: validateTrafficCorrectionInput(editForm.value.tx_correction).valid ? '' : (props.trans.invalidTrafficCorrection || 'Invalid traffic correction')
+}))
+
 const hasPingNodeErrors = computed(() => Object.values(pingNodeErrors.value).some(Boolean))
+const hasValidationErrors = computed(() => (
+  hasPingNodeErrors.value || Object.values(fieldErrors.value).some(Boolean)
+))
 
 const billingCycleOptions = BILLING_CYCLES
 const currencyOptions = CURRENCY_OPTIONS
@@ -328,14 +370,22 @@ const normalizeTgNotifySetting = (value) => {
 }
 
 const isOfflineNotifyEnabled = computed(() => normalizeTgNotifySetting(props.settings.tg_notify) !== '0')
+const hasNotificationTarget = computed(() => {
+  if (props.settings.notification_webhook_enabled) {
+    return Boolean(String(props.settings.notification_webhook_url || '').trim())
+  }
+  return Boolean(String(props.settings.tg_bot_token || '').trim())
+})
 const hasNodeNotificationOptions = computed(() => (
-  !!props.settings.tg_bot_token &&
-  isOfflineNotifyEnabled.value
+  isOfflineNotifyEnabled.value && hasNotificationTarget.value
 ))
 const isWssReportEnabled = computed(() => props.settings.wss_report_enabled === true)
 
 const normalizePriceInput = () => {
-  editForm.value.price = normalizePrice(editForm.value.price)
+  const check = validatePriceInput(editForm.value.price)
+  if (check.valid) {
+    editForm.value.price = check.value
+  }
 }
 
 const openDatePicker = (event) => {
@@ -370,8 +420,6 @@ watch(
   },
   { immediate: true }
 )
-
-const emit = defineEmits(['save', 'close', 'toggle-auto-update'])
 
 const handleAutoUpdateChange = (event) => {
   const nextValue = event.target.checked

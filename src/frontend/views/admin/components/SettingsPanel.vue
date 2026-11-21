@@ -145,40 +145,40 @@
         <div class="form-row">
           <div class="form-group flex-1 checkbox-item">
             <input type="checkbox" id="cfg_is_public" v-model="settings.is_public">
-            <label><b>{{ trans.publicAccess }}</b></label>
+            <label for="cfg_is_public"><b>{{ trans.publicAccess }}</b></label>
           </div>
 
           <div class="form-group flex-1 checkbox-item">
             <input type="checkbox" id="cfg_show_price" v-model="settings.show_price">
-            <label>{{ trans.showPrice }}</label>
+            <label for="cfg_show_price">{{ trans.showPrice }}</label>
           </div>
 
           <div class="form-group flex-1 checkbox-item">
             <input type="checkbox" id="cfg_show_expire" v-model="settings.show_expire">
-            <label>{{ trans.showExpire }}</label>
+            <label for="cfg_show_expire">{{ trans.showExpire }}</label>
           </div>
         </div>
 
         <div class="form-row">
           <div class="form-group flex-1 checkbox-item">
             <input type="checkbox" id="cfg_wss_report_enabled" v-model="settings.wss_report_enabled">
-            <label><b>{{ trans.wssReportEnabled }}</b></label>
+            <label for="cfg_wss_report_enabled"><b>{{ trans.wssReportEnabled }}</b></label>
             <HelpTooltip :text="trans.wssReportTip" />
           </div>
           <div class="form-group flex-1 checkbox-item">
             <input type="checkbox" id="cfg_show_tf" v-model="settings.show_tf">
-            <label>{{ trans.showTf }}</label>
+            <label for="cfg_show_tf">{{ trans.showTf }}</label>
           </div>
           <div class="form-group flex-1 checkbox-item">
             <input type="checkbox" id="cfg_show_three_net_details" v-model="settings.show_three_net_details">
-            <label>{{ trans.showThreeNetDetails }}</label>
+            <label for="cfg_show_three_net_details">{{ trans.showThreeNetDetails }}</label>
           </div>
         </div>
 
         <div class="form-row">
           <div class="form-group flex-1 checkbox-item">
             <input type="checkbox" id="cfg_auto_discovery" v-model="settings.auto_discovery">
-            <label><b>{{ trans.autoDiscovery }}</b></label>
+            <label for="cfg_auto_discovery"><b>{{ trans.autoDiscovery }}</b></label>
             <HelpTooltip :text="trans.autoDiscoveryTip" />
           </div>
         </div>
@@ -483,7 +483,8 @@
               {{ trans.trafficAlertThreshold }} (%)
               <HelpTooltip :text="trans.trafficAlertThresholdTip" />
             </label>
-            <input type="number" v-model.number="settings.traffic_alert_threshold" class="form-input" min="0" max="100" step="1" placeholder="0">
+            <input type="text" inputmode="numeric" v-model="settings.traffic_alert_threshold" :class="['form-input', { 'input-invalid': trafficAlertThresholdError }]" placeholder="0">
+            <p v-if="trafficAlertThresholdError" class="text-red text-sm mt-1">{{ trafficAlertThresholdError }}</p>
           </div>
         </div>
 
@@ -514,12 +515,13 @@
           >
             <span class="resource-alert-caret" :class="{ expanded: resourceAlertExpanded }">▸</span>
             <span class="section-subtitle">{{ trans.resourceAlert }}</span>
-            <span class="resource-alert-count">[{{ resourceAlertRules.length }}]</span>
+            <span class="resource-alert-count">[{{ resourceAlertRules.length }}/20]</span>
             <span class="resource-alert-toggle-text">{{ resourceAlertToggleText }}</span>
           </button>
           <HelpTooltip :text="trans.resourceAlertTip" />
-          <button type="button" class="btn btn-primary btn-sm" @click="addResourceAlertRule">+ {{ trans.resourceAlertAddRule }}</button>
+          <button type="button" class="btn btn-primary btn-sm" :disabled="resourceAlertRules.length >= 20" @click="addResourceAlertRule">+ {{ trans.resourceAlertAddRule }}</button>
         </div>
+        <p v-if="resourceAlertRules.length >= 20" class="text-yellow text-sm mb-2">{{ trans.resourceAlertMaxRulesHint }}</p>
 
         <div v-if="resourceAlertExpanded" class="resource-alert-body">
           <div v-if="resourceAlertRules.length === 0" class="resource-alert-empty text-muted text-sm">
@@ -546,14 +548,15 @@
 
               <div class="form-group flex-1">
                 <label class="form-label">{{ trans.resourceAlertMetric }}</label>
-                <select v-model="rule.metric" class="form-select" @change="normalizeRuleThreshold(rule)">
+                <select v-model="rule.metric" class="form-select" @change="handleRuleMetricChange(rule)">
                   <option v-for="option in resourceAlertMetricOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
                 </select>
               </div>
 
               <div class="form-group flex-1">
                 <label class="form-label">{{ trans.resourceAlertThreshold }}</label>
-                <input type="number" min="0" :max="resourceAlertThresholdMax(rule.metric)" step="1" v-model="rule.threshold" class="form-input" :placeholder="resourceAlertThresholdPlaceholder(rule.metric)">
+                <input type="text" inputmode="decimal" v-model="rule.threshold" :class="['form-input', { 'input-invalid': getRuleThresholdError(rule) }]" :placeholder="resourceAlertThresholdPlaceholder(rule.metric)">
+                <p v-if="getRuleThresholdError(rule)" class="text-red text-sm mt-1">{{ getRuleThresholdError(rule) }}</p>
               </div>
             </div>
 
@@ -604,13 +607,13 @@
           <div class="form-group flex-1">
             <div class="checkbox-item">
               <input type="checkbox" id="cfg_turnstile_enabled" v-model="settings.turnstile_enabled">
-              <label><b>{{ trans.enableTurnstile }}</b></label>
+              <label for="cfg_turnstile_enabled"><b>{{ trans.enableTurnstile }}</b></label>
             </div>
             </div>
           <div class="form-group flex-1">
             <div class="checkbox-item">
               <input type="checkbox" id="cfg_turnstile_login_enabled" v-model="settings.turnstile_login_enabled">
-              <label>{{ trans.enableTurnstileLogin }}</label>
+              <label for="cfg_turnstile_login_enabled">{{ trans.enableTurnstileLogin }}</label>
               <HelpTooltip :text="trans.turnstileLoginTip" />
             </div>
           </div>
@@ -787,39 +790,39 @@
 
         <div class="ping-node-grid">
           <div class="ping-node-item">
-            <div class="ping-node-fields"><input type="text" v-model.trim="settings.custom_ct_name" class="form-input ping-node-name"><span class="ping-node-arrow">→</span>
+            <div class="ping-node-fields"><input type="text" v-model.trim="settings.custom_ct_name" class="form-input ping-node-name" :placeholder="trans.customCt"><span class="ping-node-arrow">→</span>
             <input type="text" v-model.trim="settings.custom_ct" :class="['form-input', { 'input-invalid': pingNodeErrors.custom_ct }]" placeholder="gd-ct-dualstack.ip.zstaticcdn.com">
             </div><p v-if="pingNodeErrors.custom_ct" class="text-red text-sm mt-1">{{ pingNodeErrors.custom_ct }}</p>
           </div>
 
           <div class="ping-node-item">
-            <div class="ping-node-fields"><input type="text" v-model.trim="settings.custom_cu_name" class="form-input ping-node-name"><span class="ping-node-arrow">→</span>
+            <div class="ping-node-fields"><input type="text" v-model.trim="settings.custom_cu_name" class="form-input ping-node-name" :placeholder="trans.customCu"><span class="ping-node-arrow">→</span>
             <input type="text" v-model.trim="settings.custom_cu" :class="['form-input', { 'input-invalid': pingNodeErrors.custom_cu }]" placeholder="gd-cu-dualstack.ip.zstaticcdn.com">
             </div><p v-if="pingNodeErrors.custom_cu" class="text-red text-sm mt-1">{{ pingNodeErrors.custom_cu }}</p>
           </div>
         </div>
         <div class="ping-node-grid">
           <div class="ping-node-item">
-            <div class="ping-node-fields"><input type="text" v-model.trim="settings.custom_cm_name" class="form-input ping-node-name"><span class="ping-node-arrow">→</span>
+            <div class="ping-node-fields"><input type="text" v-model.trim="settings.custom_cm_name" class="form-input ping-node-name" :placeholder="trans.customCm"><span class="ping-node-arrow">→</span>
             <input type="text" v-model.trim="settings.custom_cm" :class="['form-input', { 'input-invalid': pingNodeErrors.custom_cm }]" placeholder="gd-cm-dualstack.ip.zstaticcdn.com">
             </div><p v-if="pingNodeErrors.custom_cm" class="text-red text-sm mt-1">{{ pingNodeErrors.custom_cm }}</p>
           </div>
 
           <div class="ping-node-item">
-            <div class="ping-node-fields"><input type="text" v-model.trim="settings.custom_bd_name" class="form-input ping-node-name"><span class="ping-node-arrow">→</span>
+            <div class="ping-node-fields"><input type="text" v-model.trim="settings.custom_bd_name" class="form-input ping-node-name" :placeholder="trans.customBd"><span class="ping-node-arrow">→</span>
             <input type="text" v-model.trim="settings.custom_bd" :class="['form-input', { 'input-invalid': pingNodeErrors.custom_bd }]" placeholder="ip.zstaticcdn.com">
             </div><p v-if="pingNodeErrors.custom_bd" class="text-red text-sm mt-1">{{ pingNodeErrors.custom_bd }}</p>
           </div>
         </div>
         <div class="ping-node-grid">
-          <div v-for="field in ['node_1', 'node_2']" :key="field" class="ping-node-item">
-            <div class="ping-node-fields"><input type="text" v-model.trim="settings[`${field}_name`]" class="form-input ping-node-name"><span class="ping-node-arrow">→</span><input type="text" v-model.trim="settings[field]" :class="['form-input', { 'input-invalid': pingNodeErrors[field] }]" placeholder="host[:port] / [IPv6]:port"></div>
+          <div v-for="(field, idx) in ['node_1', 'node_2']" :key="field" class="ping-node-item">
+            <div class="ping-node-fields"><input type="text" v-model.trim="settings[`${field}_name`]" class="form-input ping-node-name" :placeholder="trans[`pingNode_${idx + 1}`]"><span class="ping-node-arrow">→</span><input type="text" v-model.trim="settings[field]" :class="['form-input', { 'input-invalid': pingNodeErrors[field] }]" placeholder="host[:port] / [IPv6]:port"></div>
             <p v-if="pingNodeErrors[field]" class="text-red text-sm mt-1">{{ pingNodeErrors[field] }}</p>
           </div>
         </div>
         <div class="ping-node-grid">
-          <div v-for="field in ['node_3', 'node_4']" :key="field" class="ping-node-item">
-            <div class="ping-node-fields"><input type="text" v-model.trim="settings[`${field}_name`]" class="form-input ping-node-name"><span class="ping-node-arrow">→</span><input type="text" v-model.trim="settings[field]" :class="['form-input', { 'input-invalid': pingNodeErrors[field] }]" placeholder="host[:port] / [IPv6]:port"></div>
+          <div v-for="(field, idx) in ['node_3', 'node_4']" :key="field" class="ping-node-item">
+            <div class="ping-node-fields"><input type="text" v-model.trim="settings[`${field}_name`]" class="form-input ping-node-name" :placeholder="trans[`pingNode_${idx + 3}`]"><span class="ping-node-arrow">→</span><input type="text" v-model.trim="settings[field]" :class="['form-input', { 'input-invalid': pingNodeErrors[field] }]" placeholder="host[:port] / [IPv6]:port"></div>
             <p v-if="pingNodeErrors[field]" class="text-red text-sm mt-1">{{ pingNodeErrors[field] }}</p>
           </div>
         </div>
@@ -838,6 +841,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } 
 import HelpTooltip from '../../../components/HelpTooltip.vue'
 import { FRONTEND_WS_TIMEOUT_MINUTES_MAX, HISTORY } from '../../../utils/constants.js'
 import { PING_NODE_FIELDS, validatePingNode } from '../../../utils/pingNode.js'
+import { validateResourceAlertThresholdInput, validateTrafficAlertPercentInput } from '../../../utils/server.js'
 import { LANGUAGES, LANGUAGE_MAP } from '../../../locales'
 import { NOTIFICATION_LANGUAGE_CODES } from '../../../../shared/languages.js'
 
@@ -1038,7 +1042,13 @@ const wssReportHours = computed(() => {
     .sort((a, b) => a - b)
 })
 
-const localHourToUtcHour = hour => new Date(2000, 0, 1, hour, 0, 0, 0).getUTCHours()
+// 以当前日期计算本地小时对应的 UTC 小时：固定取某一年的日期会把
+// 夏令时偏移冻结下来（北半球冬/南半球夏差 1 小时），导致计划整体偏移
+const localHourToUtcHour = hour => {
+  const d = new Date()
+  d.setHours(hour, 0, 0, 0)
+  return d.getUTCHours()
+}
 
 const localTimezoneLabel = computed(() => {
   const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone
@@ -1384,19 +1394,30 @@ const resourceAlertServerSelectLabel = (rule) => {
 const createRuleId = () => `rule_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
 const isNetworkAlertMetric = metric => metric === 'netIn' || metric === 'netOut'
 const resourceAlertThresholdPlaceholder = metric => isNetworkAlertMetric(metric) ? '100' : '80'
-const resourceAlertThresholdMax = metric => isNetworkAlertMetric(metric) ? 100000 : 100
 
-const normalizeRuleThreshold = (rule) => {
-  const threshold = Number(rule.threshold)
-  const max = resourceAlertThresholdMax(rule.metric)
-  if (!Number.isFinite(threshold) || threshold <= 0 || threshold > max) {
+const handleRuleMetricChange = (rule) => {
+  const raw = String(rule.threshold ?? '').trim()
+  if (!raw) {
     rule.threshold = resourceAlertThresholdPlaceholder(rule.metric)
   }
 }
 
+const getRuleThresholdError = (rule) => (
+  validateResourceAlertThresholdInput(rule.threshold, rule.metric).valid
+    ? ''
+    : (props.trans.invalidResourceAlertThreshold || 'Invalid threshold')
+)
+
+const trafficAlertThresholdError = computed(() => (
+  validateTrafficAlertPercentInput(props.settings.traffic_alert_threshold, { allowEmpty: true }).valid
+    ? ''
+    : (props.trans.invalidTrafficAlertPercent || 'Invalid threshold')
+))
+
 const addResourceAlertRule = () => {
-  resourceAlertExpanded.value = true
   const rules = ensureResourceAlertRules()
+  if (rules.length >= 20) return
+  resourceAlertExpanded.value = true
   const metric = 'cpu'
   const rule = {
     id: createRuleId(),

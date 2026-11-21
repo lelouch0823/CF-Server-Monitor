@@ -51,7 +51,7 @@
 </template>
 
 <script setup>
-import { nextTick, onBeforeUnmount, ref } from 'vue'
+import { nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 
 const props = defineProps({
   text: { type: String, default: '' },
@@ -163,14 +163,24 @@ const handleDocumentPointerDown = event => {
   closeTooltip()
 }
 
-window.addEventListener('resize', updatePosition)
-window.addEventListener('scroll', updatePosition, true)
-document.addEventListener('pointerdown', handleDocumentPointerDown)
+onMounted(() => {
+  if (typeof window !== 'undefined') {
+    window.addEventListener('resize', updatePosition)
+    window.addEventListener('scroll', updatePosition, true)
+  }
+  if (typeof document !== 'undefined') {
+    document.addEventListener('pointerdown', handleDocumentPointerDown)
+  }
+})
 
 onBeforeUnmount(() => {
   clearCloseTimer()
-  window.removeEventListener('resize', updatePosition)
-  window.removeEventListener('scroll', updatePosition, true)
-  document.removeEventListener('pointerdown', handleDocumentPointerDown)
+  if (typeof window !== 'undefined') {
+    window.removeEventListener('resize', updatePosition)
+    window.removeEventListener('scroll', updatePosition, true)
+  }
+  if (typeof document !== 'undefined') {
+    document.removeEventListener('pointerdown', handleDocumentPointerDown)
+  }
 })
 </script>

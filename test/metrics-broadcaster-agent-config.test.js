@@ -487,7 +487,9 @@ test('WSS agent context keeps an authenticated session when server lookup throws
 test('WSS agent context asks the agent to retry when lookup throws before auth', async () => {
   const sent = [];
   const closed = [];
+  // secret 校验通过后才进入 server 详情查询：未认证会话必须携带正确 secret
   const broadcaster = makeBroadcaster([], {
+    API_SECRET: 'test-secret',
     DB: {
       prepare() {
         return {
@@ -515,7 +517,8 @@ test('WSS agent context asks the agent to retry when lookup throws before auth',
     authenticated: false,
     serverId: ''
   }, {
-    id: 'degraded-server-2'
+    id: 'degraded-server-2',
+    secret: 'test-secret'
   });
 
   assert.equal(context, null);

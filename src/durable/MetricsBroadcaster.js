@@ -12,11 +12,13 @@
 //   通过 setWebSocketAutoResponse 自动响应 ping，无需唤醒 DO。
 // - Agent 上报连接使用标准 WebSocket API，避免高频指标消息计为 hibernation wakeup。
 
-import { saveMetricsHistory } from '../database/schema.js';
+import { clampMetricTimestamp, saveMetricsHistory } from '../database/schema.js';
 import { evaluateTrafficAlert } from '../services/notification.js';
 import { ensureServerOptimization } from '../database/indexOptimization.js';
 import { getServerDetail, clearServerDetailCache } from '../utils/cache.js';
 import { getWssReportScheduleState, loadSiteSettings } from '../utils/settings.js';
+import { timingSafeEqualString } from '../utils/common.js';
+import { parseAllowedOrigins } from '../utils/cors.js';
 import {
   AGENT_CONFIG_MD5_HEADER,
   AGENT_CONFIG_LEGACY_SCHEMA_VERSION,
@@ -57,17 +59,25 @@ const WS_POLICY_VIOLATION = 1008;
 const WS_MESSAGE_TOO_BIG = 1009;
 const WS_TRY_AGAIN_LATER = 1013;
 const AGENT_REPORT_KIND = 'agent-report';
+export const AGENT_WSS_AUTH_TIMEOUT_MS = 5000;
+export const MAX_STANDARD_AGENT_WEBSOCKETS = 1000;
+export const MAX_FRONTEND_WEBSOCKETS = 2000;
+const HIDDEN_SERVERS_CACHE_TTL_MS = 30 * 1000;
 const AGENT_WSS_MODE_HEADER = 'X-Agent-Wss-Mode';
 const AGENT_WSS_REASON_HEADER = 'X-Agent-Wss-Reason';
 const AGENT_WSS_SCHEDULE_INACTIVE = 'wss_schedule_inactive';
 const AGENT_WSS_SCHEDULE_DISABLED = 'wss_disabled';
 const ALLOWED_AGENT_REPORT_INTERVALS = new Set([30, 60, 120, 180]);
 const RESOURCE_ALERT_STORAGE_KEY = 'resource_alert_windows_v1';
+// DO storage 单值上限 2MB：快照按预算裁剪，超限从最久未更新的服务器开始丢弃，
+// 保证任意规模下 put 不会因超限失败（失败会导致告警窗口永久丢失）
+const RESOURCE_ALERT_SNAPSHOT_MAX_BYTES = 1024 * 1024;
 const RESOURCE_ALERT_BUCKET_MS = 60 * 1000;
 const RESOURCE_ALERT_MAX_BUCKETS = 10;
 const RESOURCE_ALERT_MAX_SERVERS = 1000;
 const RESOURCE_ALERT_EVALUATE_RULE_BATCH_MAX = 20;
 const RESOURCE_ALERT_SNAPSHOT_INTERVAL_MS = 60 * 1000;
+const AGENT_CACHE_SWEEP_INTERVAL_MS = 60 * 1000;
 const RESOURCE_ALERT_CACHE_ACTIVE_GRACE_MS = 3 * 60 * 1000;
 const RESOURCE_ALERT_LATEST_TOLERANCE_MS = 2 * 60 * 1000;
 const RESOURCE_ALERT_MIN_SAMPLE_RATIO = 0.4;
@@ -79,14 +89,40 @@ function getAlertCutoffMinute(now, buckets) {
     Math.max(0, buckets - 1) * RESOURCE_ALERT_BUCKET_MS;
 }
 
-function parseAllowedOrigins(corsAllowedOrigins) {
-  if (!corsAllowedOrigins || corsAllowedOrigins.trim() === '') {
-    return [];
+function isHiddenFlag(value) {
+  if (value === true || value === 1) return true;
+  const normalized = String(value ?? '').trim().toLowerCase();
+  return normalized === '1' || normalized === 'true';
+}
+
+function isWebSocketOriginAllowed(origin, realOrigin, allowedOrigins) {
+  if (origin === null || origin === undefined) return true;
+  return origin === realOrigin || allowedOrigins.includes(origin);
+}
+
+function buildWebSocketOriginHeaders(origin, realOrigin, allowedOrigins) {
+  const headers = new Headers();
+  if (origin && (origin === realOrigin || allowedOrigins.includes(origin))) {
+    headers.set('Access-Control-Allow-Origin', origin);
+    if (allowedOrigins.includes(origin)) {
+      headers.set('Access-Control-Allow-Credentials', 'true');
+    }
+    headers.set('Vary', 'Origin');
   }
-  return corsAllowedOrigins
-    .split(',')
-    .map(o => o.trim())
-    .filter(o => o !== '');
+  return headers;
+}
+
+function extractAgentSecretFromHeaders(request) {
+  const authHeader = request.headers.get('Authorization');
+  const agentSecretHeader = request.headers.get('X-Agent-Secret');
+  if (authHeader === null && agentSecretHeader === null) {
+    return { present: false, secret: '' };
+  }
+  if (agentSecretHeader !== null) {
+    return { present: true, secret: agentSecretHeader.trim() };
+  }
+  const match = String(authHeader || '').trim().match(/^Bearer\s+(.+)$/i);
+  return { present: true, secret: match ? match[1].trim() : '' };
 }
 
 function toFiniteNumber(value) {
@@ -173,7 +209,13 @@ function maskPublicIpUpdate(update) {
   };
 }
 
-function normalizeResourceAlertSample(sample) {
+function normalizeSubscribeScope(raw) {
+  const trimmed = String(raw ?? '').trim();
+  if (!trimmed) return 'all';
+  return trimmed.toLowerCase() === 'all' ? 'all' : trimmed;
+}
+
+function normalizeResourceAlertSample(sample, now = Date.now()) {
   if (!sample || typeof sample !== 'object') {
     return null;
   }
@@ -184,7 +226,8 @@ function normalizeResourceAlertSample(sample) {
   }
 
   const metrics = data.metrics || data.payload || data;
-  const ts = normalizeMetricTimestamp(sample.ts || sample.timestamp || metrics.sample_timestamp || metrics.last_updated || metrics.timestamp);
+  const rawTs = sample.ts ?? sample.timestamp ?? metrics.sample_timestamp ?? metrics.last_updated ?? metrics.timestamp;
+  const ts = clampMetricTimestamp(rawTs, now);
   const cpu = toFiniteNumber(metrics.cpu);
   const ramTotal = toFiniteNumber(metrics.ram_total);
   const ramUsed = toFiniteNumber(metrics.ram_used);
@@ -288,6 +331,15 @@ export class MetricsBroadcaster {
     this.resourceAlertCacheActiveUntil = 0;
     this.agentServerDetails = new Map();
     this.agentHistoryWrites = new Map();
+    this.agentCacheLastSweepTs = 0;
+    this.cachedSiteSettings = null;
+    this.cachedSiteSettingsAt = 0;
+    this.hiddenServerIds = new Set();
+    this.explicitVisibilityByServer = new Map();
+    this.hiddenServersLoadedAt = 0;
+    this.agentAuthTimeoutMs = AGENT_WSS_AUTH_TIMEOUT_MS;
+    this.maxStandardAgentWebSockets = MAX_STANDARD_AGENT_WEBSOCKETS;
+    this.maxFrontendWebSockets = MAX_FRONTEND_WEBSOCKETS;
     this.standardAgentWebSocketCount = 0;
     this.standardAgentWebSockets = new Set();
     this.lastAgentRealtimeHintAt = 0;
@@ -304,6 +356,10 @@ export class MetricsBroadcaster {
         JSON.stringify({ type: 'pong' })
       )
     );
+
+    if (typeof this.state?.blockConcurrencyWhile === 'function') {
+      this.state.blockConcurrencyWhile(() => this._ensureResourceAlertSnapshotLoaded());
+    }
   }
 
   _isValidServerId(id) {
@@ -425,9 +481,12 @@ export class MetricsBroadcaster {
     if (!sessionScope) return false;
     if (sessionScope === 'all') {
       if (!serverIds || serverIds.length === 0) return false;
-      return serverIds.includes(serverId);
+      if (serverIds.includes(serverId)) return true;
+      const lowerTarget = String(serverId || '').toLowerCase();
+      return serverIds.some(id => String(id || '').toLowerCase() === lowerTarget);
     }
-    return sessionScope === serverId;
+    if (sessionScope === serverId) return true;
+    return sessionScope.toLowerCase() === String(serverId || '').toLowerCase();
   }
 
   _getFrontendWebSockets() {
@@ -439,6 +498,160 @@ export class MetricsBroadcaster {
 
   _getFrontendSubscriberCount() {
     return this._getFrontendWebSockets().length;
+  }
+
+  _getSubscriberCount() {
+    return this._getFrontendSubscriberCount();
+  }
+
+  _hasNonAdminFrontendSubscriber() {
+    return this._getFrontendWebSockets().some(ws => {
+      const attachment = ws.deserializeAttachment();
+      return attachment && attachment.isAdmin !== true;
+    });
+  }
+
+  _syncServerVisibility(serverId, rawHidden) {
+    const key = String(serverId || '').trim();
+    if (!key || rawHidden === undefined || rawHidden === null) return;
+    const hidden = isHiddenFlag(rawHidden);
+    this.explicitVisibilityByServer.set(key, hidden);
+    if (hidden) {
+      this.hiddenServerIds.add(key);
+    } else {
+      this.hiddenServerIds.delete(key);
+    }
+  }
+
+  _isServerHidden(serverId) {
+    const key = String(serverId || '').trim();
+    if (!key) return false;
+
+    const now = Date.now();
+    const cachedDetail = this.agentServerDetails.get(key);
+    if (
+      cachedDetail &&
+      cachedDetail.data &&
+      now - cachedDetail.time < AGENT_SERVER_DETAIL_TTL_MS &&
+      cachedDetail.data.is_hidden !== undefined &&
+      cachedDetail.data.is_hidden !== null
+    ) {
+      return isHiddenFlag(cachedDetail.data.is_hidden);
+    }
+
+    if (this.explicitVisibilityByServer.has(key)) {
+      return this.explicitVisibilityByServer.get(key) === true;
+    }
+
+    if (this.hiddenServerIds.has(key)) {
+      return true;
+    }
+
+    const lowerKey = key.toLowerCase();
+    for (const [id, entry] of this.agentServerDetails) {
+      if (String(id).toLowerCase() !== lowerKey) continue;
+      if (
+        entry?.data &&
+        now - entry.time < AGENT_SERVER_DETAIL_TTL_MS &&
+        entry.data.is_hidden !== undefined &&
+        entry.data.is_hidden !== null
+      ) {
+        return isHiddenFlag(entry.data.is_hidden);
+      }
+    }
+    for (const [id, hidden] of this.explicitVisibilityByServer) {
+      if (String(id).toLowerCase() === lowerKey) {
+        return hidden === true;
+      }
+    }
+    for (const hiddenId of this.hiddenServerIds) {
+      if (String(hiddenId).toLowerCase() === lowerKey) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  _isHiddenOrUnknownForPublic(serverId) {
+    if (this._isServerHidden(serverId)) return true;
+    if (this.hiddenServersLoadedAt === 0) {
+      const key = String(serverId || '').trim();
+      if (this.explicitVisibilityByServer.get(key) === false) return false;
+      const lowerKey = key.toLowerCase();
+      for (const [id, hidden] of this.explicitVisibilityByServer) {
+        if (String(id).toLowerCase() === lowerKey && hidden === false) {
+          return false;
+        }
+      }
+      return true;
+    }
+    return false;
+  }
+
+  async _ensureHiddenServersLoaded(force = false) {
+    const now = Date.now();
+    if (
+      !force &&
+      this.hiddenServersLoadedAt > 0 &&
+      now - this.hiddenServersLoadedAt < HIDDEN_SERVERS_CACHE_TTL_MS
+    ) {
+      return this.hiddenServerIds;
+    }
+
+    if (typeof this.env?.DB?.prepare !== 'function') {
+      this.hiddenServersLoadedAt = now;
+      return this.hiddenServerIds;
+    }
+
+    try {
+      const stmt = this.env.DB.prepare(
+        'SELECT id FROM servers WHERE CAST(COALESCE(is_hidden, 0) AS INTEGER) = 1'
+      );
+      if (stmt && typeof stmt.all === 'function') {
+        const queryResult = await stmt.all();
+        const rows = Array.isArray(queryResult?.results)
+          ? queryResult.results
+          : (Array.isArray(queryResult) ? queryResult : []);
+        const nextHidden = new Set();
+        for (const row of rows) {
+          const id = String(row?.id || '').trim();
+          if (id) nextHidden.add(id);
+        }
+        for (const [id, hidden] of this.explicitVisibilityByServer) {
+          if (hidden) {
+            nextHidden.add(id);
+          } else {
+            nextHidden.delete(id);
+          }
+        }
+        for (const [id, entry] of this.agentServerDetails) {
+          if (!entry?.data || now - entry.time >= AGENT_SERVER_DETAIL_TTL_MS) continue;
+          if (entry.data.is_hidden === undefined || entry.data.is_hidden === null) continue;
+          if (isHiddenFlag(entry.data.is_hidden)) {
+            nextHidden.add(id);
+          } else {
+            nextHidden.delete(id);
+          }
+        }
+        this.hiddenServerIds = nextHidden;
+      }
+      this.hiddenServersLoadedAt = now;
+    } catch (e) {
+      console.warn('[ws] Failed to load hidden servers:', e?.message || e);
+    }
+
+    return this.hiddenServerIds;
+  }
+
+  async _loadCachedSiteSettings(forceRefresh = false) {
+    if (!forceRefresh && this.cachedSiteSettings && Date.now() - this.cachedSiteSettingsAt < 30_000) {
+      return this.cachedSiteSettings;
+    }
+    const settings = await loadSiteSettings(this.env.DB, { forceRefresh });
+    this.cachedSiteSettings = settings;
+    this.cachedSiteSettingsAt = Date.now();
+    return settings;
   }
 
   _getFrontendAllSubscriberCount() {
@@ -470,36 +683,103 @@ export class MetricsBroadcaster {
     } catch (_) {}
   }
 
+  _createWebSocketUpgradeResponse(client, headers) {
+    try {
+      return new Response(null, {
+        status: 101,
+        webSocket: client,
+        headers
+      });
+    } catch (err) {
+      if (err instanceof RangeError) {
+        return {
+          status: 101,
+          webSocket: client,
+          headers: headers instanceof Headers ? headers : new Headers(headers)
+        };
+      }
+      throw err;
+    }
+  }
+
   _acceptStandardAgentWebSocket(server, initialAttachment) {
     // Agent 上报连接使用标准 WebSocket API，避免每条业务消息都成为 hibernation wakeup。
     // 代价是只要 Agent 长连接存在，本 DO 就不能休眠，会持续产生 duration。
     server.accept();
 
-    const session = { attachment: initialAttachment || {} };
+    const session = {
+      attachment: initialAttachment || {},
+      authTimer: null
+    };
+    let cleaned = false;
+    let messageQueue = Promise.resolve();
+
+    const clearAuthTimer = () => {
+      if (session.authTimer !== null) {
+        clearTimeout(session.authTimer);
+        session.authTimer = null;
+      }
+    };
+
     const ws = {
       send: data => server.send(data),
-      close: (code, reason) => server.close(code, reason),
+      close: (code, reason) => {
+        cleanup();
+        try {
+          server.close(code, reason);
+        } catch (_) {}
+      },
       serializeAttachment(value) {
         session.attachment = value || {};
+        if (session.attachment.authenticated) {
+          clearAuthTimer();
+        }
       },
       deserializeAttachment() {
         return session.attachment;
+      },
+      clearAuthTimeout: clearAuthTimer
+    };
+
+    const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
+      clearAuthTimer();
+      this.standardAgentWebSocketCount = Math.max(0, this.standardAgentWebSocketCount - 1);
+      this.standardAgentWebSockets.delete(ws);
+      if (this.standardAgentWebSockets.size === 0 && this.resourceAlertSnapshotDirty) {
+        const persistPromise = this._persistResourceAlertSnapshotIfNeeded(Date.now(), true);
+        if (typeof this.state?.waitUntil === 'function') {
+          this.state.waitUntil(persistPromise);
+        }
       }
     };
 
     this.standardAgentWebSocketCount += 1;
     this.standardAgentWebSockets.add(ws);
-    let cleaned = false;
-    const cleanup = () => {
-      if (cleaned) return;
-      cleaned = true;
-      this.standardAgentWebSocketCount = Math.max(0, this.standardAgentWebSocketCount - 1);
-      this.standardAgentWebSockets.delete(ws);
-    };
+
+    if (!session.attachment.authenticated) {
+      const timeoutMs = Math.max(1, Number(this.agentAuthTimeoutMs) || AGENT_WSS_AUTH_TIMEOUT_MS);
+      session.authTimer = setTimeout(() => {
+        session.authTimer = null;
+        if (!cleaned && !session.attachment?.authenticated) {
+          cleanup();
+          try {
+            server.close(WS_POLICY_VIOLATION, 'Authentication timeout');
+          } catch (_) {}
+        }
+      }, timeoutMs);
+    }
 
     server.addEventListener('message', event => {
-      this._handleAgentReportMessage(ws, event.data, ws.deserializeAttachment())
+      const rawData = event.data;
+      messageQueue = messageQueue
+        .then(async () => {
+          if (cleaned) return;
+          await this._handleAgentReportMessage(ws, rawData, ws.deserializeAttachment());
+        })
         .catch(error => {
+          if (cleaned) return;
           console.warn('[update-ws] Agent standard WebSocket message failed:', error?.message || error);
           this._closeWsWithError(ws, 'Internal error', 500);
         });
@@ -683,7 +963,29 @@ export class MetricsBroadcaster {
     }
     const server = await getServerDetail(this.env.DB, key, true);
     this.agentServerDetails.set(key, { data: server, time: now });
+    if (server && server.is_hidden !== undefined && server.is_hidden !== null) {
+      this._syncServerVisibility(key, server.is_hidden);
+    }
     return server;
+  }
+
+  _evictDuplicateAgentWebSockets(serverId, currentWs) {
+    let evicted = 0;
+    for (const otherWs of this._getAgentReportWebSockets()) {
+      if (otherWs === currentWs) continue;
+      const otherAttachment = otherWs.deserializeAttachment() || {};
+      if (
+        otherAttachment.kind === AGENT_REPORT_KIND &&
+        otherAttachment.authenticated &&
+        otherAttachment.serverId === serverId
+      ) {
+        try {
+          otherWs.close(WS_POLICY_VIOLATION, 'Superseded by newer connection');
+          evicted += 1;
+        } catch (_) {}
+      }
+    }
+    return evicted;
   }
 
   async _resolveAgentContext(ws, attachment, data) {
@@ -700,8 +1002,10 @@ export class MetricsBroadcaster {
     }
 
     const hasSecret = Object.prototype.hasOwnProperty.call(data, 'secret');
-    if (!attachment.authenticated || hasSecret) {
-      if (data.secret !== this.env.API_SECRET) {
+    if ((!attachment.authenticated && !attachment.secretVerified) || hasSecret) {
+      const providedSecret = typeof data.secret === 'string' ? data.secret : '';
+      const expectedSecret = typeof this.env.API_SECRET === 'string' ? this.env.API_SECRET : '';
+      if (!providedSecret || !expectedSecret || !timingSafeEqualString(providedSecret, expectedSecret)) {
         this._closeWsWithError(ws, 'Invalid secret', 401);
         return null;
       }
@@ -740,6 +1044,7 @@ export class MetricsBroadcaster {
       }
     }
 
+    const wasAuthenticated = Boolean(attachment.authenticated);
     const agentVersion = normalizeAgentVersion(
       data.agent_version ??
       data.metrics?.agent_version ??
@@ -771,6 +1076,7 @@ export class MetricsBroadcaster {
       ...attachment,
       kind: AGENT_REPORT_KIND,
       authenticated: true,
+      secretVerified: true,
       serverId,
       historyPartitionId: serverDetail.history_partition_id,
       agentVersion,
@@ -780,6 +1086,9 @@ export class MetricsBroadcaster {
       configMd5: agentConfig.md5
     };
     ws.serializeAttachment(nextAttachment);
+    if (!wasAuthenticated) {
+      this._evictDuplicateAgentWebSockets(serverId, ws);
+    }
 
     return {
       attachment: nextAttachment,
@@ -1072,6 +1381,9 @@ export class MetricsBroadcaster {
       await this._cacheResourceAlertSamples(normalizedUpdates, reportTs);
     }
     this._cacheLatestReportUpdates(normalizedUpdates, reportTs);
+    if (this._hasNonAdminFrontendSubscriber()) {
+      await this._ensureHiddenServersLoaded();
+    }
     if (options.batchFrontend === true) {
       this._broadcastBatch(normalizedUpdates, reportTs, 'single');
       this._queueFrontendBroadcastBatch(normalizedUpdates, reportTs);
@@ -1235,10 +1547,29 @@ export class MetricsBroadcaster {
     return hinted;
   }
 
+  async _saveAgentMetricsHistory(
+    serverId,
+    historyPartitionId,
+    metrics,
+    regionCode,
+    timestamp,
+    agentVersion
+  ) {
+    return saveMetricsHistory(
+      this.env.DB,
+      serverId,
+      historyPartitionId,
+      metrics,
+      regionCode,
+      timestamp,
+      agentVersion
+    );
+  }
+
   async _persistAgentHistoryIfDue(ws, attachment, payload) {
     const serverId = String(payload.serverId || '');
     const now = Date.now();
-    const state = this.agentHistoryWrites.get(serverId) || {};
+    const state = this.agentHistoryWrites.get(serverId) || { createdTs: now };
     const currentAggregate = payload.historyAggregate ||
       collectHistoryMetricAggregates([{ metrics: payload.metrics }]);
 
@@ -1279,8 +1610,7 @@ export class MetricsBroadcaster {
     this.agentHistoryWrites.set(serverId, state);
     try {
       const metrics = applyHistoryMetricAggregates(payload.metrics, aggregateForWrite);
-      await saveMetricsHistory(
-        this.env.DB,
+      const saveRes = await this._saveAgentMetricsHistory(
         serverId,
         payload.historyPartitionId,
         metrics,
@@ -1288,6 +1618,9 @@ export class MetricsBroadcaster {
         payload.timestamp,
         payload.agentVersion
       );
+      if (saveRes && saveRes.ok === false) {
+        throw new Error(saveRes.error || 'saveMetricsHistory failed');
+      }
       // 月流量阈值告警：写入成功后台非阻塞执行（waitUntil），不阻塞 WebSocket 消息循环
       if (typeof this.state?.waitUntil === 'function') {
         this.state.waitUntil((async () => {
@@ -1298,6 +1631,10 @@ export class MetricsBroadcaster {
               patchCache: (id, value) => {
                 const entry = this.agentServerDetails.get(id);
                 if (entry && entry.data) entry.data.traffic_alert_state = value;
+              },
+              invalidateCache: (id) => {
+                this.agentServerDetails.delete(id);
+                clearServerDetailCache(id);
               }
             });
           } catch (e) {
@@ -1347,7 +1684,19 @@ export class MetricsBroadcaster {
       return;
     }
 
-    if (msg?.type === 'pong') return;
+    if (msg?.type === 'pong') {
+      if (!attachment?.authenticated) {
+        this._closeWsWithError(
+          ws,
+          'Authentication required',
+          401,
+          {},
+          WS_POLICY_VIOLATION,
+          'Authentication required'
+        );
+      }
+      return;
+    }
 
     const scheduleCheckAfter = Number(attachment.wssScheduleCheckAfter);
     if (Number.isFinite(scheduleCheckAfter) && Date.now() >= scheduleCheckAfter) {
@@ -1390,11 +1739,18 @@ export class MetricsBroadcaster {
       return;
     }
 
-    const samples = normalizeMetricSamples(data);
-    if (samples.length === 0) {
+    const reportTs = Date.now();
+    const rawSamples = normalizeMetricSamples(data);
+    if (rawSamples.length === 0) {
       this._closeWsWithError(ws, 'Missing metrics', 400);
       return;
     }
+    const samples = rawSamples
+      .map(sample => ({
+        ...sample,
+        ts: clampMetricTimestamp(sample.ts, reportTs)
+      }))
+      .sort((a, b) => a.ts - b.ts);
 
     const latestSample = samples[samples.length - 1];
     const latestMetrics = getReportMetrics(data, latestSample);
@@ -1406,11 +1762,13 @@ export class MetricsBroadcaster {
       context.agentVersion,
       latestMetrics
     );
-    const reportTs = Date.now();
     const normalizedUpdates = [{
       serverId: context.serverId,
       samples: broadcastSamples
     }];
+    if (!this.resourceAlertSnapshotLoaded) {
+      await this._ensureResourceAlertSnapshotLoaded();
+    }
     const realtimeState = this._getAgentRealtimeState(reportTs);
     if (realtimeState.realtimeActive) {
       await this._ingestRealtimeUpdates(normalizedUpdates, reportTs, { batchFrontend: true });
@@ -1418,16 +1776,29 @@ export class MetricsBroadcaster {
       this._cacheLatestReportUpdates(normalizedUpdates, reportTs);
     }
 
-    const persisted = await this._persistAgentHistoryIfDue(ws, context.attachment, {
-      serverId: context.serverId,
-      historyPartitionId: context.historyPartitionId,
-      metrics: latestMetrics,
-      historyAggregate,
-      regionCode: context.regionCode,
-      timestamp: latestSample.ts,
-      agentVersion: context.agentVersion,
-      reportIntervalMs: context.reportIntervalMs
-    });
+    let persisted;
+    try {
+      persisted = await this._persistAgentHistoryIfDue(ws, context.attachment, {
+        serverId: context.serverId,
+        historyPartitionId: context.historyPartitionId,
+        metrics: latestMetrics,
+        historyAggregate,
+        regionCode: context.regionCode,
+        timestamp: latestSample.ts,
+        agentVersion: context.agentVersion,
+        reportIntervalMs: context.reportIntervalMs
+      });
+    } catch (e) {
+      console.warn('[update-ws] Failed to persist agent history:', e?.message || e);
+      const fallbackIntervalMs = Math.max(
+        1000,
+        Number(context.reportIntervalMs) || AGENT_DEFAULT_HISTORY_WRITE_INTERVAL_MS
+      );
+      persisted = {
+        persisted: false,
+        nextD1WriteAfterMs: Math.min(fallbackIntervalMs, 10_000)
+      };
+    }
 
     const configAck = await this._buildAgentConfigAck(context);
     const nextWssReportAfterMs = this._getAgentNextWssReportAfterMs(
@@ -1453,11 +1824,40 @@ export class MetricsBroadcaster {
     const origin = request.headers.get('Origin');
     const allowedOrigins = parseAllowedOrigins(this.env.CORS_ALLOWED_ORIGINS);
     const realOrigin = request.headers.get('X-Real-Origin') || `${url.protocol}//${url.host}`;
-    if (origin && allowedOrigins.length > 0 && !allowedOrigins.includes(origin) && origin !== realOrigin) {
+    if (!isWebSocketOriginAllowed(origin, realOrigin, allowedOrigins)) {
       return new Response('Forbidden', { status: 403 });
     }
 
-    const settings = await loadSiteSettings(this.env.DB, { forceRefresh: true });
+    const headerSecretInfo = extractAgentSecretFromHeaders(request);
+    let secretVerified = false;
+    if (headerSecretInfo.present) {
+      const expectedSecret = typeof this.env.API_SECRET === 'string' ? this.env.API_SECRET : '';
+      if (
+        !headerSecretInfo.secret ||
+        !expectedSecret ||
+        !timingSafeEqualString(headerSecretInfo.secret, expectedSecret)
+      ) {
+        return new Response('Unauthorized', { status: 401 });
+      }
+      secretVerified = true;
+    }
+
+    if (this.standardAgentWebSockets.size >= this.maxStandardAgentWebSockets) {
+      for (const candidate of this.standardAgentWebSockets) {
+        const att = candidate.deserializeAttachment();
+        if (!att?.authenticated) {
+          try {
+            candidate.close(WS_POLICY_VIOLATION, 'Evicted oldest unauthenticated connection');
+          } catch (_) {}
+          break;
+        }
+      }
+      if (this.standardAgentWebSockets.size >= this.maxStandardAgentWebSockets) {
+        return new Response('Too many agent WebSocket connections', { status: 503 });
+      }
+    }
+
+    const settings = await this._loadCachedSiteSettings(true);
     const scheduleState = getWssReportScheduleState(settings);
     if (!scheduleState.active) {
       return this._createAgentWssUnavailableResponse(scheduleState);
@@ -1471,6 +1871,7 @@ export class MetricsBroadcaster {
     const agentSocket = this._acceptStandardAgentWebSocket(server, {
       kind: AGENT_REPORT_KIND,
       authenticated: false,
+      secretVerified,
       serverId: '',
       historyPartitionId: 0,
       region: request.headers.get('cf-ipcountry') || '',
@@ -1498,16 +1899,131 @@ export class MetricsBroadcaster {
     });
     await this._scheduleAgentWssHourAlarm();
 
-    const responseHeaders = new Headers();
-    if (origin && allowedOrigins.length > 0) {
-      responseHeaders.set('Access-Control-Allow-Origin', origin);
-      responseHeaders.set('Access-Control-Allow-Credentials', 'true');
+    const responseHeaders = buildWebSocketOriginHeaders(origin, realOrigin, allowedOrigins);
+
+    return this._createWebSocketUpgradeResponse(client, responseHeaders);
+  }
+
+  async _handleInternalInvalidate(request) {
+    let body = null;
+    try {
+      body = await request.json();
+    } catch (_) {
+      return Response.json({ error: 'invalid JSON' }, { status: 400 });
     }
 
-    return new Response(null, {
-      status: 101,
-      webSocket: client,
-      headers: responseHeaders
+    const deletedServerIds = Array.isArray(body?.deletedServerIds) ? body.deletedServerIds : [];
+    const updatedServerIds = Array.isArray(body?.updatedServerIds) ? body.updatedServerIds : [];
+    const refreshSettings = body?.refreshSettings === true;
+
+    let deletedCount = 0;
+    let updatedCount = 0;
+    let closedSockets = 0;
+    let resourceAlertDirty = false;
+
+    if (deletedServerIds.length > 0) {
+      await this._ensureResourceAlertSnapshotLoaded();
+      clearServerDetailCache();
+
+      const deletedSet = new Set();
+      for (const rawId of deletedServerIds) {
+        const serverId = String(rawId || '').trim();
+        if (!serverId) continue;
+        deletedSet.add(serverId);
+      }
+
+      for (const ws of this._getAgentReportWebSockets()) {
+        const attachment = ws.deserializeAttachment() || {};
+        if (attachment.kind === AGENT_REPORT_KIND && deletedSet.has(attachment.serverId)) {
+          try {
+            ws.close(WS_POLICY_VIOLATION, 'Server deleted');
+            closedSockets += 1;
+          } catch (_) {}
+        }
+      }
+
+      for (const serverId of deletedSet) {
+        deletedCount += 1;
+        this.agentServerDetails.delete(serverId);
+        this.agentHistoryWrites.delete(serverId);
+        this.latestReportUpdates.delete(serverId);
+        this.pendingFrontendBroadcasts.delete(serverId);
+        this.hiddenServerIds.delete(serverId);
+        this.explicitVisibilityByServer.delete(serverId);
+        if (this.resourceAlertWindows.delete(serverId)) {
+          resourceAlertDirty = true;
+        }
+      }
+
+      if (resourceAlertDirty) {
+        this.resourceAlertSnapshotDirty = true;
+        await this._persistResourceAlertSnapshotIfNeeded(Date.now(), true);
+      }
+    }
+
+    if (updatedServerIds.length > 0) {
+      clearServerDetailCache();
+      this.hiddenServersLoadedAt = 0;
+
+      for (const rawId of updatedServerIds) {
+        const serverId = String(rawId || '').trim();
+        if (!serverId) continue;
+        updatedCount += 1;
+        this.agentServerDetails.delete(serverId);
+        this.explicitVisibilityByServer.delete(serverId);
+      }
+      await this._ensureHiddenServersLoaded(true);
+    }
+
+    let configPushed = 0;
+    if (refreshSettings) {
+      this.cachedSiteSettings = null;
+      this.cachedSiteSettingsAt = 0;
+      const settings = await this._loadCachedSiteSettings(true);
+      const scheduleState = getWssReportScheduleState(settings);
+      if (!scheduleState.configured) {
+        const closed = this._closeAgentReportWebSockets();
+        closedSockets += closed.closed;
+      } else if (!scheduleState.active) {
+        const closed = this._closeInactiveAgentReportWebSockets();
+        closedSockets += closed.closed;
+      } else {
+        const connectedServerIds = new Set();
+        for (const ws of this._getAgentReportWebSockets()) {
+          const attachment = ws.deserializeAttachment() || {};
+          if (attachment.kind === AGENT_REPORT_KIND && attachment.authenticated && attachment.serverId) {
+            connectedServerIds.add(attachment.serverId);
+          }
+        }
+        for (const serverId of connectedServerIds) {
+          try {
+            const descriptor = await this._loadAgentConfigDescriptor(serverId, true, AGENT_CONFIG_SCHEMA_VERSION);
+            if (!descriptor) continue;
+            const descriptors = new Map([[AGENT_CONFIG_SCHEMA_VERSION, descriptor]]);
+            for (
+              let schemaVersion = AGENT_CONFIG_LEGACY_SCHEMA_VERSION;
+              schemaVersion < AGENT_CONFIG_SCHEMA_VERSION;
+              schemaVersion++
+            ) {
+              const legacyDescriptor = await this._loadAgentConfigDescriptor(serverId, false, schemaVersion);
+              if (legacyDescriptor) descriptors.set(schemaVersion, legacyDescriptor);
+            }
+            const res = this._pushAgentConfigFrame(serverId, descriptors);
+            configPushed += res.delivered;
+          } catch (e) {
+            console.warn('[invalidate] Failed to refresh agent config:', e?.message || e);
+          }
+        }
+      }
+    }
+
+    return Response.json({
+      ok: true,
+      deleted: deletedCount,
+      updated: updatedCount,
+      closedSockets,
+      configPushed,
+      refreshedSettings: refreshSettings
     });
   }
 
@@ -1524,6 +2040,13 @@ export class MetricsBroadcaster {
       return this._handleAgentConfigChanged(request);
     }
 
+    if (
+      method === 'POST' &&
+      (path === '/internal/invalidate' || path.endsWith('/internal/invalidate') || path === '/invalidate')
+    ) {
+      return this._handleInternalInvalidate(request);
+    }
+
     // ── 1) WebSocket 接入 ──────────────────────────────
     if (path === '/ws' || path.endsWith('/ws')) {
       const upgradeHeader = request.headers.get('Upgrade');
@@ -1536,14 +2059,26 @@ export class MetricsBroadcaster {
 
       // Worker 转发时通过 X-Real-Origin 传递真实 origin，替代 DO 内部的 http://internal
       const realOrigin = request.headers.get('X-Real-Origin') || `${url.protocol}//${url.host}`;
-      if (origin && allowedOrigins.length > 0 && !allowedOrigins.includes(origin) && origin !== realOrigin) {
+      if (!isWebSocketOriginAllowed(origin, realOrigin, allowedOrigins)) {
         return new Response('Forbidden', { status: 403 });
       }
 
+      if (this._getFrontendSubscriberCount() >= this.maxFrontendWebSockets) {
+        return new Response('Too many WebSocket subscribers', { status: 503 });
+      }
+
       const raw = url.searchParams.get('subscribe') || 'all';
-      const scope = raw.trim().toLowerCase();
+      const scope = normalizeSubscribeScope(raw);
       if (!this._isValidScope(scope)) {
         return new Response('Invalid subscription scope', { status: 400 });
+      }
+
+      const isAdmin = request.headers.get('X-CFSM-Admin') === '1';
+      if (!isAdmin && scope !== 'all') {
+        await this._ensureHiddenServersLoaded();
+        if (this._isHiddenOrUnknownForPublic(scope)) {
+          return new Response('Forbidden', { status: 403 });
+        }
       }
 
       // @ts-ignore - Cloudflare Workers 运行时提供 WebSocketPair
@@ -1553,8 +2088,8 @@ export class MetricsBroadcaster {
       // 使用 DO WebSocket Hibernation API 接管连接
       this.state.acceptWebSocket(server);
 
-      // 将订阅 scope 和空 serverIds 附加到 WebSocket（休眠后仍保留）
-      server.serializeAttachment({ scope, serverIds: [] });
+      // 将订阅 scope、空 serverIds 与管理员身份附加到 WebSocket（休眠后仍保留）
+      server.serializeAttachment({ scope, serverIds: [], isAdmin });
 
       // 立即发送 hello 让客户端确认连接成功
       try {
@@ -1566,19 +2101,9 @@ export class MetricsBroadcaster {
       } catch (_) {
       }
 
-      const responseHeaders = new Headers();
-      if (origin && allowedOrigins.length > 0) {
-        responseHeaders.set('Access-Control-Allow-Origin', origin);
-        responseHeaders.set('Access-Control-Allow-Credentials', 'true');
-      } else if (allowedOrigins.length === 0) {
-        responseHeaders.set('Access-Control-Allow-Origin', '*');
-      }
+      const responseHeaders = buildWebSocketOriginHeaders(origin, realOrigin, allowedOrigins);
 
-      return new Response(null, {
-        status: 101,
-        webSocket: client,
-        headers: responseHeaders
-      });
+      return this._createWebSocketUpgradeResponse(client, responseHeaders);
     }
 
     // ── 2) 广播入口：/update 成功后由 Worker 内部转发 ──
@@ -1604,23 +2129,22 @@ export class MetricsBroadcaster {
       }
 
       const reportTs = Date.now();
-      const subscribers = this._getFrontendSubscriberCount();
-      if (subscribers === 0) {
-        return new Response(JSON.stringify({ ok: true, skipped: true, subscribers: 0 }), {
-          headers: { 'Content-Type': 'application/json' }
-        });
+      await this._ensureResourceAlertSnapshotLoaded();
+      const subscribers = this._getSubscriberCount();
+      if (subscribers === 0 && !this._shouldCacheResourceAlertSamples(reportTs)) {
+        return Response.json({ ok: true, skipped: true, subscribers: 0 });
       }
       if (this._shouldCacheResourceAlertSamples(reportTs)) {
-        await this._ensureResourceAlertSnapshotLoaded();
         await this._cacheResourceAlertSamples([{
           serverId,
           samples: [{ ts: reportTs, data: payload }]
         }], reportTs);
       }
+      if (this._hasNonAdminFrontendSubscriber()) {
+        await this._ensureHiddenServersLoaded();
+      }
       this._broadcast(serverId, payload);
-      return new Response(JSON.stringify({ ok: true, subscribers }), {
-        headers: { 'Content-Type': 'application/json' }
-      });
+      return Response.json({ ok: true, subscribers: this._getSubscriberCount() });
     }
 
     // ── 2b) 批量推送入口 ──────────────────────────────
@@ -1654,30 +2178,45 @@ export class MetricsBroadcaster {
 
       const maintainState = body?.maintainState === true;
       const latestReportOnly = body?.latestReportOnly === true;
-      const subscribers = this._getFrontendSubscriberCount();
+      const subscribers = this._getSubscriberCount();
       if (!maintainState && !latestReportOnly && subscribers === 0) {
-        return new Response(JSON.stringify({ ok: true, skipped: true, count: normalizedUpdates.length, subscribers: 0 }), {
-          headers: { 'Content-Type': 'application/json' }
+        return Response.json({
+          ok: true,
+          skipped: true,
+          count: normalizedUpdates.length,
+          subscribers: 0
         });
       }
 
       const reportTs = Date.now();
-      if (latestReportOnly && subscribers === 0) {
+      if (maintainState) {
+        await this._ensureResourceAlertSnapshotLoaded();
+        const previousActiveUntil = this.resourceAlertCacheActiveUntil;
+        this._activateResourceAlertCache(reportTs);
+        if (this.resourceAlertCacheActiveUntil > previousActiveUntil) {
+          this.resourceAlertSnapshotDirty = true;
+        }
+      }
+
+      if (latestReportOnly && !maintainState && subscribers === 0) {
         this._cacheLatestReportUpdates(normalizedUpdates, reportTs);
-        return new Response(JSON.stringify({
+        return Response.json({
           ok: true,
           count: normalizedUpdates.length,
-          subscribers,
+          subscribers: this._getSubscriberCount(),
           latestReportOnly: true
-        }), {
-          headers: { 'Content-Type': 'application/json' }
         });
       }
 
       await this._ingestRealtimeUpdates(normalizedUpdates, reportTs);
+      if (maintainState && this.resourceAlertSnapshotDirty) {
+        await this._persistResourceAlertSnapshotIfNeeded(reportTs);
+      }
 
-      return new Response(JSON.stringify({ ok: true, count: normalizedUpdates.length, subscribers }), {
-        headers: { 'Content-Type': 'application/json' }
+      return Response.json({
+        ok: true,
+        count: normalizedUpdates.length,
+        subscribers: this._getSubscriberCount()
       });
     }
 
@@ -1731,8 +2270,8 @@ export class MetricsBroadcaster {
         });
       }
 
-      this._activateResourceAlertCache();
       await this._ensureResourceAlertSnapshotLoaded();
+      this._activateResourceAlertCache();
       const result = await this._evaluateResourceAlertRules(normalizedRules.rules, {
         resultFormat: body?.resultFormat
       });
@@ -1775,6 +2314,28 @@ export class MetricsBroadcaster {
         this.latestReportUpdates.delete(serverId);
       }
     }
+    // 顺带节流清扫 agent 缓存：停报/过期条目不清理会随时间常驻 DO 内存
+    if (now - this.agentCacheLastSweepTs >= AGENT_CACHE_SWEEP_INTERVAL_MS) {
+      this.agentCacheLastSweepTs = now;
+      this._pruneAgentCaches(now);
+    }
+  }
+
+  _pruneAgentCaches(now = Date.now()) {
+    for (const [key, entry] of this.agentServerDetails) {
+      if (!entry || now - entry.time >= AGENT_SERVER_DETAIL_TTL_MS) {
+        this.agentServerDetails.delete(key);
+      }
+    }
+    for (const [serverId, state] of this.agentHistoryWrites) {
+      if (state?.flushing) continue;
+      // 以最近一次 D1 写入（或条目创建）为活动时间：停报超过 TTL 的条目
+      // 等价于 DO 重启后的空状态（未冲刷聚合本就会随重启丢失），可安全清除
+      const lastActivityTs = Number(state?.lastD1WriteTs) || Number(state?.createdTs) || 0;
+      if (lastActivityTs > 0 && now - lastActivityTs > AGENT_SERVER_DETAIL_TTL_MS) {
+        this.agentHistoryWrites.delete(serverId);
+      }
+    }
   }
 
   _cacheLatestReportUpdates(updates, reportTs = Date.now()) {
@@ -1785,11 +2346,11 @@ export class MetricsBroadcaster {
       const serverId = String(update.serverId);
       // delete + set 让 Map 的插入顺序同时代表最近更新时间，便于限制内存上限。
       this.latestReportUpdates.delete(serverId);
-      this.latestReportUpdates.set(serverId, maskPublicIpUpdate({
+      this.latestReportUpdates.set(serverId, {
         serverId,
         reportTs,
         samples: update.samples
-      }));
+      });
     }
 
     while (this.latestReportUpdates.size > LATEST_REPORT_CACHE_MAX_SERVERS) {
@@ -1829,7 +2390,6 @@ export class MetricsBroadcaster {
   async _ensureResourceAlertSnapshotLoaded() {
     if (this.resourceAlertSnapshotLoaded) return;
 
-    this.resourceAlertSnapshotLoaded = true;
     try {
       const snapshot = await this.state.storage.get(RESOURCE_ALERT_STORAGE_KEY);
       const windows = Array.isArray(snapshot?.windows) ? snapshot.windows : [];
@@ -1847,7 +2407,16 @@ export class MetricsBroadcaster {
         }
       }
 
+      const savedActiveUntil = Number(
+        snapshot?.resourceAlertCacheActiveUntil ?? snapshot?.activeUntil
+      ) || 0;
+      if (savedActiveUntil > this.resourceAlertCacheActiveUntil) {
+        this.resourceAlertCacheActiveUntil = savedActiveUntil;
+      }
+
       this.resourceAlertLastSnapshotSave = Number(snapshot?.savedAt) || 0;
+      // 读取成功才标记已加载：失败保持未加载，下次调用可重试
+      this.resourceAlertSnapshotLoaded = true;
     } catch (e) {
       console.warn('[resource-alert] load snapshot failed:', e.message || e);
     }
@@ -1896,7 +2465,7 @@ export class MetricsBroadcaster {
       );
 
       for (const sample of update.samples) {
-        const normalized = normalizeResourceAlertSample(sample);
+        const normalized = normalizeResourceAlertSample(sample, now);
         if (!normalized) continue;
         minuteMap.set(normalized.minuteTs, normalized);
       }
@@ -1918,21 +2487,40 @@ export class MetricsBroadcaster {
 
   async _persistResourceAlertSnapshotIfNeeded(now = Date.now(), force = false) {
     if (!this.resourceAlertSnapshotDirty && !force) return;
-    if (!force && now - this.resourceAlertLastSnapshotSave < RESOURCE_ALERT_SNAPSHOT_INTERVAL_MS) return;
+    const canHibernateAnytime = this.standardAgentWebSockets.size === 0;
+    const minIntervalMs = canHibernateAnytime ? 0 : RESOURCE_ALERT_SNAPSHOT_INTERVAL_MS;
+    if (!force && minIntervalMs > 0 && now - this.resourceAlertLastSnapshotSave < minIntervalMs) return;
 
     this._pruneResourceAlertWindows(now);
+    // 按字节预算序列化：Map 按最近更新排序（update/prune 都会 delete+set 置尾），
+    // 超出预算即停止，丢弃最久未更新的服务器，与容量淘汰策略方向一致
     const windows = [];
+    let size = 64;
+    let droppedServers = 0;
     for (const [serverId, window] of this.resourceAlertWindows) {
       if (!window || !Array.isArray(window.samples) || window.samples.length === 0) continue;
-      windows.push({
-        serverId,
-        samples: window.samples
-      });
+      if (droppedServers > 0) {
+        droppedServers++;
+        continue;
+      }
+      const entry = { serverId, samples: window.samples };
+      const entrySize = JSON.stringify(entry).length;
+      if (size + entrySize > RESOURCE_ALERT_SNAPSHOT_MAX_BYTES) {
+        droppedServers = 1;
+        continue;
+      }
+      size += entrySize;
+      windows.push(entry);
+    }
+    if (droppedServers > 0) {
+      console.warn(`[resource-alert] snapshot exceeds ${RESOURCE_ALERT_SNAPSHOT_MAX_BYTES} bytes, dropped ${droppedServers} least-recently-updated server windows from persistence`);
     }
 
     try {
       await this.state.storage.put(RESOURCE_ALERT_STORAGE_KEY, {
         savedAt: now,
+        activeUntil: this.resourceAlertCacheActiveUntil,
+        resourceAlertCacheActiveUntil: this.resourceAlertCacheActiveUntil,
         windows
       });
       this.resourceAlertSnapshotDirty = false;
@@ -2078,6 +2666,9 @@ export class MetricsBroadcaster {
     return updates.map(item => {
       if (!item || !item.serverId) return null;
       const serverId = String(item.serverId);
+      if (item.isHidden !== undefined || item.is_hidden !== undefined) {
+        this._syncServerVisibility(serverId, item.isHidden ?? item.is_hidden);
+      }
       const rawSamples = Array.isArray(item.samples)
         ? item.samples
         : (item.payload ? [{ ts: now, payload: item.payload }] : []);
@@ -2086,7 +2677,8 @@ export class MetricsBroadcaster {
         if (!sample || typeof sample !== 'object') return null;
         const data = sample.data || sample.payload || sample.metrics;
         if (!data || typeof data !== 'object') return null;
-        const ts = Number(sample.ts || sample.timestamp || data.last_updated || now) || now;
+        const rawTs = sample.ts ?? sample.timestamp ?? data.sample_timestamp ?? data.last_updated;
+        const ts = clampMetricTimestamp(rawTs, now);
         return { ts, data };
       }).filter(Boolean);
 
@@ -2097,31 +2689,116 @@ export class MetricsBroadcaster {
   }
 
   _broadcastBatch(updates, ts = Date.now(), targetScope = null) {
+    if (!Array.isArray(updates) || updates.length === 0) return;
+
     const websockets = this._getFrontendWebSockets();
+    if (websockets.length === 0) return;
+
+    const activeSubscribers = [];
+    let hasAdminSubscriber = false;
+    let hasPublicSubscriber = false;
 
     for (const ws of websockets) {
       const attachment = ws.deserializeAttachment();
       if (!attachment) continue;
       if (targetScope === 'all' && attachment.scope !== 'all') continue;
       if (targetScope === 'single' && attachment.scope === 'all') continue;
+      const isAdmin = attachment.isAdmin === true;
+      if (isAdmin) {
+        hasAdminSubscriber = true;
+      } else {
+        hasPublicSubscriber = true;
+      }
+      activeSubscribers.push({ ws, attachment, isAdmin });
+    }
 
-      const scopedUpdates = updates
-        .filter(item => this._shouldDeliver(attachment.scope, item.serverId, attachment.serverIds))
-        .map(maskPublicIpUpdate);
-      if (scopedUpdates.length === 0) continue;
+    if (activeSubscribers.length === 0) return;
 
-      const message = JSON.stringify({
-        type: 'batchUpdate',
-        ts,
-        updates: scopedUpdates
+    // 循环外按节点预计算一次管理员版与公开版（maskPublicIpUpdate）及序列化片段，
+    // 将 O(订阅者 × 节点数) 的克隆与序列化降为 O(节点数)
+    const preparedUpdates = [];
+    for (const item of updates) {
+      if (!item || !item.serverId || !Array.isArray(item.samples) || item.samples.length === 0) continue;
+      const serverId = String(item.serverId);
+      const hidden = this._isHiddenOrUnknownForPublic(serverId);
+      const adminUpdate = { serverId, samples: item.samples };
+      const publicUpdate = (!hidden && hasPublicSubscriber)
+        ? maskPublicIpUpdate(adminUpdate)
+        : null;
+      preparedUpdates.push({
+        serverId,
+        hidden,
+        adminJson: hasAdminSubscriber ? JSON.stringify(adminUpdate) : null,
+        publicJson: publicUpdate ? JSON.stringify(publicUpdate) : null
       });
+    }
 
+    if (preparedUpdates.length === 0) return;
+
+    const encodedTs = JSON.stringify(ts);
+    for (const { ws, attachment, isAdmin } of activeSubscribers) {
+      const matchedJsons = [];
+      for (const entry of preparedUpdates) {
+        if (!isAdmin && entry.hidden) continue;
+        if (!this._shouldDeliver(attachment.scope, entry.serverId, attachment.serverIds)) continue;
+        const json = isAdmin ? entry.adminJson : entry.publicJson;
+        if (json) {
+          matchedJsons.push(json);
+        }
+      }
+      if (matchedJsons.length === 0) continue;
+
+      const message = `{"type":"batchUpdate","ts":${encodedTs},"updates":[${matchedJsons.join(',')}]}`;
       try {
         ws.send(message);
       } catch (_) {
         // WebSocket 已异常关闭，DO 会自动清理
       }
     }
+  }
+
+  _replayLatestUpdatesOnSubscribe(ws, scope, serverIds, isAdmin) {
+    const now = Date.now();
+    this._pruneLatestReportUpdates(now);
+    if (this.latestReportUpdates.size === 0) return;
+
+    const targetIds = scope === 'all'
+      ? serverIds
+      : [scope];
+    if (!targetIds || targetIds.length === 0) return;
+
+    const replayUpdates = [];
+    for (const serverId of targetIds) {
+      if (!isAdmin && this._isHiddenOrUnknownForPublic(serverId)) continue;
+      let cached = this.latestReportUpdates.get(serverId);
+      let resolvedId = serverId;
+      if (!cached) {
+        const lowerId = String(serverId || '').toLowerCase();
+        for (const [k, v] of this.latestReportUpdates) {
+          if (String(k).toLowerCase() === lowerId) {
+            cached = v;
+            resolvedId = k;
+            break;
+          }
+        }
+      }
+      if (!cached || !Array.isArray(cached.samples) || cached.samples.length === 0) continue;
+      const baseUpdate = {
+        serverId: resolvedId,
+        samples: cached.samples
+      };
+      replayUpdates.push(isAdmin ? baseUpdate : maskPublicIpUpdate(baseUpdate));
+    }
+
+    if (replayUpdates.length === 0) return;
+
+    try {
+      ws.send(JSON.stringify({
+        type: 'batchUpdate',
+        ts: now,
+        updates: replayUpdates
+      }));
+    } catch (_) {}
   }
 
   async webSocketMessage(ws, message) {
@@ -2147,7 +2824,7 @@ export class MetricsBroadcaster {
           return;
         }
 
-        const scope = rawScope.trim().toLowerCase();
+        const scope = normalizeSubscribeScope(rawScope);
         if (!this._isValidScope(scope)) {
           this._closeInvalidSubscription(ws);
           return;
@@ -2159,8 +2836,25 @@ export class MetricsBroadcaster {
           return;
         }
 
-        const serverIds = normalizedServerIds.ids;
-        ws.serializeAttachment({ scope, serverIds });
+        const isAdmin = current.isAdmin === true;
+        if (!isAdmin) {
+          await this._ensureHiddenServersLoaded();
+          if (scope !== 'all' && this._isHiddenOrUnknownForPublic(scope)) {
+            this._closeInvalidSubscription(ws);
+            return;
+          }
+        }
+
+        const serverIds = isAdmin
+          ? normalizedServerIds.ids
+          : normalizedServerIds.ids.filter(id => !this._isHiddenOrUnknownForPublic(id));
+
+        ws.serializeAttachment({
+          ...current,
+          scope,
+          serverIds,
+          isAdmin
+        });
         try {
           ws.send(JSON.stringify({
             type: 'subscribed',
@@ -2169,6 +2863,7 @@ export class MetricsBroadcaster {
             count: serverIds.length
           }));
         } catch (_) {}
+        this._replayLatestUpdatesOnSubscribe(ws, scope, serverIds, isAdmin);
         try {
           await this._hintAgentRealtimeIntervals({
             frontendActive: true,

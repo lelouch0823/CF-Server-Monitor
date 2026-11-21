@@ -1,9 +1,9 @@
 <template>
-  <div class="modal-overlay" :class="{ active: show }">
+  <div class="modal-overlay" :class="{ active: show }" role="dialog" aria-modal="true" :aria-label="`${trans.batchEdit} [${selectedCount}]`">
     <div class="modal-dialog batch-edit-modal">
       <div class="modal-header">
         <div class="modal-title">{{ trans.batchEdit }} [{{ selectedCount }}]</div>
-        <button class="modal-close" @click="$emit('close')">×</button>
+        <button type="button" class="modal-close" :disabled="saving" @click="$emit('close')">×</button>
       </div>
 
       <div class="batch-edit-grid">
@@ -28,7 +28,8 @@
             </select>
           </BatchEditField>
           <BatchEditField :enabled="enabled.price" :label="trans.price" @toggle="toggleField('price', $event)">
-            <input type="text" v-model="form.price" class="form-input" :disabled="!enabled.price" placeholder="40.00">
+            <input type="text" inputmode="decimal" v-model="form.price" :class="['form-input', { 'input-invalid': fieldErrors.price }]" :disabled="!enabled.price" placeholder="40.00" @blur="normalizeBatchPriceInput">
+            <p v-if="fieldErrors.price" class="text-red text-sm mt-1">{{ fieldErrors.price }}</p>
           </BatchEditField>
           <BatchEditField :enabled="enabled.billing_cycle" :label="trans.billingCycle" @toggle="toggleField('billing_cycle', $event)">
             <select v-model="form.billing_cycle" class="form-select" :disabled="!enabled.billing_cycle">
@@ -49,7 +50,8 @@
         <div class="batch-edit-section">
           <div class="section-subtitle">{{ trans.monthlyTraffic }}</div>
           <BatchEditField :enabled="enabled.traffic_limit" :label="`${trans.trafficLimit} (GB)`" @toggle="toggleField('traffic_limit', $event)">
-            <input type="number" v-model="form.traffic_limit" class="form-input" :disabled="!enabled.traffic_limit" min="0" step="1">
+            <input type="text" inputmode="decimal" v-model="form.traffic_limit" :class="['form-input', { 'input-invalid': fieldErrors.traffic_limit }]" :disabled="!enabled.traffic_limit">
+            <p v-if="fieldErrors.traffic_limit" class="text-red text-sm mt-1">{{ fieldErrors.traffic_limit }}</p>
           </BatchEditField>
           <BatchEditField :enabled="enabled.traffic_calc_type" :label="trans.trafficCalcType" @toggle="toggleField('traffic_calc_type', $event)">
             <select v-model="form.traffic_calc_type" class="form-select" :disabled="!enabled.traffic_calc_type">
@@ -66,13 +68,16 @@
             </select>
           </BatchEditField>
           <BatchEditField :enabled="enabled.traffic_alert_percent" :label="`${trans.trafficAlertPercent} (%)`" @toggle="toggleField('traffic_alert_percent', $event)">
-            <input type="number" v-model="form.traffic_alert_percent" class="form-input" :disabled="!enabled.traffic_alert_percent" min="0" max="100" step="1">
+            <input type="text" inputmode="numeric" v-model="form.traffic_alert_percent" :class="['form-input', { 'input-invalid': fieldErrors.traffic_alert_percent }]" :disabled="!enabled.traffic_alert_percent">
+            <p v-if="fieldErrors.traffic_alert_percent" class="text-red text-sm mt-1">{{ fieldErrors.traffic_alert_percent }}</p>
           </BatchEditField>
           <BatchEditField :enabled="enabled.rx_correction" :label="`${trans.rxCorrection} (GB)`" @toggle="toggleField('rx_correction', $event)">
-            <input type="number" v-model="form.rx_correction" class="form-input" :disabled="!enabled.rx_correction" min="0" step="0.1">
+            <input type="text" inputmode="decimal" v-model="form.rx_correction" :class="['form-input', { 'input-invalid': fieldErrors.rx_correction }]" :disabled="!enabled.rx_correction">
+            <p v-if="fieldErrors.rx_correction" class="text-red text-sm mt-1">{{ fieldErrors.rx_correction }}</p>
           </BatchEditField>
           <BatchEditField :enabled="enabled.tx_correction" :label="`${trans.txCorrection} (GB)`" @toggle="toggleField('tx_correction', $event)">
-            <input type="number" v-model="form.tx_correction" class="form-input" :disabled="!enabled.tx_correction" min="0" step="0.1">
+            <input type="text" inputmode="decimal" v-model="form.tx_correction" :class="['form-input', { 'input-invalid': fieldErrors.tx_correction }]" :disabled="!enabled.tx_correction">
+            <p v-if="fieldErrors.tx_correction" class="text-red text-sm mt-1">{{ fieldErrors.tx_correction }}</p>
           </BatchEditField>
         </div>
 
@@ -113,26 +118,32 @@
             </select>
           </BatchEditField>
           <BatchEditField :enabled="enabled.interface" :label="trans.networkInterface" @toggle="toggleField('interface', $event)">
-            <input type="text" v-model.trim="form.interface" class="form-input" :disabled="!enabled.interface" placeholder="eth0">
+            <input type="text" v-model.trim="form.interface" :class="['form-input', { 'input-invalid': fieldErrors.interface }]" :disabled="!enabled.interface" placeholder="eth0">
+            <p v-if="fieldErrors.interface" class="text-red text-sm mt-1">{{ fieldErrors.interface }}</p>
           </BatchEditField>
         </div>
 
         <div class="batch-edit-section">
           <div class="section-subtitle">{{ trans.pingNodes }}</div>
-          <BatchEditField :enabled="enabled.custom_ct" :label="settings.custom_ct_name || trans.customCt" @toggle="toggleField('custom_ct', $event)">
-            <input type="text" v-model.trim="form.custom_ct" class="form-input" :disabled="!enabled.custom_ct" :placeholder="settings.custom_ct || 'gd-ct-dualstack.ip.zstaticcdn.com'">
+          <BatchEditField :enabled="enabled.custom_ct" :label="pingNodeLabel('custom_ct')" @toggle="toggleField('custom_ct', $event)">
+            <input type="text" v-model.trim="form.custom_ct" :class="['form-input', { 'input-invalid': pingNodeErrors.custom_ct }]" :disabled="!enabled.custom_ct" :placeholder="settings.custom_ct || 'gd-ct-dualstack.ip.zstaticcdn.com'">
+            <p v-if="pingNodeErrors.custom_ct" class="text-red text-sm mt-1">{{ pingNodeErrors.custom_ct }}</p>
           </BatchEditField>
-          <BatchEditField :enabled="enabled.custom_cu" :label="settings.custom_cu_name || trans.customCu" @toggle="toggleField('custom_cu', $event)">
-            <input type="text" v-model.trim="form.custom_cu" class="form-input" :disabled="!enabled.custom_cu" :placeholder="settings.custom_cu || 'gd-cu-dualstack.ip.zstaticcdn.com'">
+          <BatchEditField :enabled="enabled.custom_cu" :label="pingNodeLabel('custom_cu')" @toggle="toggleField('custom_cu', $event)">
+            <input type="text" v-model.trim="form.custom_cu" :class="['form-input', { 'input-invalid': pingNodeErrors.custom_cu }]" :disabled="!enabled.custom_cu" :placeholder="settings.custom_cu || 'gd-cu-dualstack.ip.zstaticcdn.com'">
+            <p v-if="pingNodeErrors.custom_cu" class="text-red text-sm mt-1">{{ pingNodeErrors.custom_cu }}</p>
           </BatchEditField>
-          <BatchEditField :enabled="enabled.custom_cm" :label="settings.custom_cm_name || trans.customCm" @toggle="toggleField('custom_cm', $event)">
-            <input type="text" v-model.trim="form.custom_cm" class="form-input" :disabled="!enabled.custom_cm" :placeholder="settings.custom_cm || 'gd-cm-dualstack.ip.zstaticcdn.com'">
+          <BatchEditField :enabled="enabled.custom_cm" :label="pingNodeLabel('custom_cm')" @toggle="toggleField('custom_cm', $event)">
+            <input type="text" v-model.trim="form.custom_cm" :class="['form-input', { 'input-invalid': pingNodeErrors.custom_cm }]" :disabled="!enabled.custom_cm" :placeholder="settings.custom_cm || 'gd-cm-dualstack.ip.zstaticcdn.com'">
+            <p v-if="pingNodeErrors.custom_cm" class="text-red text-sm mt-1">{{ pingNodeErrors.custom_cm }}</p>
           </BatchEditField>
-          <BatchEditField :enabled="enabled.custom_bd" :label="settings.custom_bd_name || trans.customBd" @toggle="toggleField('custom_bd', $event)">
-            <input type="text" v-model.trim="form.custom_bd" class="form-input" :disabled="!enabled.custom_bd" :placeholder="settings.custom_bd || 'ip.zstaticcdn.com'">
+          <BatchEditField :enabled="enabled.custom_bd" :label="pingNodeLabel('custom_bd')" @toggle="toggleField('custom_bd', $event)">
+            <input type="text" v-model.trim="form.custom_bd" :class="['form-input', { 'input-invalid': pingNodeErrors.custom_bd }]" :disabled="!enabled.custom_bd" :placeholder="settings.custom_bd || 'ip.zstaticcdn.com'">
+            <p v-if="pingNodeErrors.custom_bd" class="text-red text-sm mt-1">{{ pingNodeErrors.custom_bd }}</p>
           </BatchEditField>
-          <BatchEditField v-for="(field, index) in ['node_1', 'node_2', 'node_3', 'node_4']" :key="field" :enabled="enabled[field]" :label="settings[`${field}_name`] || `Node ${index + 1}`" @toggle="toggleField(field, $event)">
-            <input type="text" v-model.trim="form[field]" class="form-input" :disabled="!enabled[field]" :placeholder="settings[field] || 'host[:port] / [IPv6]:port'">
+          <BatchEditField v-for="field in ['node_1', 'node_2', 'node_3', 'node_4']" :key="field" :enabled="enabled[field]" :label="pingNodeLabel(field)" @toggle="toggleField(field, $event)">
+            <input type="text" v-model.trim="form[field]" :class="['form-input', { 'input-invalid': pingNodeErrors[field] }]" :disabled="!enabled[field]" :placeholder="settings[field] || 'host[:port] / [IPv6]:port'">
+            <p v-if="pingNodeErrors[field]" class="text-red text-sm mt-1">{{ pingNodeErrors[field] }}</p>
           </BatchEditField>
         </div>
 
@@ -160,8 +171,8 @@
       </div>
 
       <div class="modal-footer flex-justify-between">
-        <button @click="$emit('save')" class="btn btn-primary" :disabled="!hasEnabledFields">{{ saving ? trans.saving : trans.save }}</button>
-        <button @click="$emit('close')" class="btn">{{ trans.cancel }}</button>
+        <button type="button" @click="$emit('save')" class="btn btn-primary" :disabled="!hasEnabledFields || saving || hasValidationErrors">{{ saving ? trans.saving : trans.save }}</button>
+        <button type="button" @click="$emit('close')" class="btn" :disabled="saving">{{ trans.cancel }}</button>
       </div>
     </div>
   </div>
@@ -170,13 +181,25 @@
 <script setup>
 import { computed } from 'vue'
 import BatchEditField from './BatchEditField.vue'
+import { useModal } from '../../../composables/useModal.js'
+import { PING_NODE_FIELDS, validatePingNode } from '../../../utils/pingNode.js'
 import { currentLang } from '../../../utils/i18n.js'
-import { BILLING_CYCLES, CURRENCY_OPTIONS, getLocalizedOptionField } from '../../../utils/server.js'
+import {
+  BILLING_CYCLES,
+  CURRENCY_OPTIONS,
+  getLocalizedOptionField,
+  getLocalizedPingNodeLabel,
+  validateNetworkInterfaceInput,
+  validatePriceInput,
+  validateTrafficAlertPercentInput,
+  validateTrafficCorrectionInput,
+  validateTrafficLimitInput
+} from '../../../utils/server.js'
 
 const form = defineModel('form', { type: Object, required: true })
 const enabled = defineModel('enabled', { type: Object, required: true })
 
-defineProps({
+const props = defineProps({
   trans: { type: Object, required: true },
   show: { type: Boolean, default: false },
   selectedCount: { type: Number, default: 0 },
@@ -185,7 +208,38 @@ defineProps({
   saving: { type: Boolean, default: false }
 })
 
-defineEmits(['save', 'close'])
+const emit = defineEmits(['save', 'close'])
+
+useModal(() => props.show, () => emit('close'), {
+  canClose: () => !props.saving
+})
+
+const pingNodeLabel = (field) => getLocalizedPingNodeLabel(field, props.settings, props.trans)
+
+const pingNodeErrorMessage = computed(() => (
+  props.trans.invalidPingNodeFormat || 'Use domain, IPv4, or host:port. Port must be 1-65535.'
+))
+
+const pingNodeErrors = computed(() => Object.fromEntries(
+  PING_NODE_FIELDS.map(field => [
+    field,
+    enabled.value[field] && !validatePingNode(form.value[field]).valid ? pingNodeErrorMessage.value : ''
+  ])
+))
+
+const fieldErrors = computed(() => ({
+  price: enabled.value.price && !validatePriceInput(form.value.price).valid ? (props.trans.invalidPrice || 'Invalid price') : '',
+  traffic_limit: enabled.value.traffic_limit && !validateTrafficLimitInput(form.value.traffic_limit).valid ? (props.trans.invalidTrafficLimit || 'Invalid traffic limit') : '',
+  traffic_alert_percent: enabled.value.traffic_alert_percent && !validateTrafficAlertPercentInput(form.value.traffic_alert_percent).valid ? (props.trans.invalidTrafficAlertPercent || 'Invalid threshold') : '',
+  rx_correction: enabled.value.rx_correction && !validateTrafficCorrectionInput(form.value.rx_correction).valid ? (props.trans.invalidTrafficCorrection || 'Invalid traffic correction') : '',
+  tx_correction: enabled.value.tx_correction && !validateTrafficCorrectionInput(form.value.tx_correction).valid ? (props.trans.invalidTrafficCorrection || 'Invalid traffic correction') : '',
+  interface: enabled.value.interface && !validateNetworkInterfaceInput(form.value.interface).valid ? (props.trans.invalidNetworkInterface || 'Invalid network interface') : ''
+}))
+
+const hasValidationErrors = computed(() => (
+  Object.values(pingNodeErrors.value).some(Boolean) ||
+  Object.values(fieldErrors.value).some(Boolean)
+))
 
 const billingCycleOptions = BILLING_CYCLES
 const currencyOptions = CURRENCY_OPTIONS
@@ -209,6 +263,14 @@ const toggleField = (field, checked) => {
   enabled.value[field] = checked
 }
 
+const normalizeBatchPriceInput = () => {
+  if (!enabled.value.price) return
+  const check = validatePriceInput(form.value.price)
+  if (check.valid) {
+    form.value.price = check.value
+  }
+}
+
 const openDatePicker = (event) => {
   const input = event?.currentTarget
   if (typeof input?.showPicker !== 'function') return
@@ -216,5 +278,4 @@ const openDatePicker = (event) => {
     input.showPicker()
   } catch (_) {}
 }
-
 </script>

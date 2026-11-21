@@ -1,9 +1,9 @@
 <template>
-  <div id="autoDiscoveryModal" class="modal-overlay" :class="{ active: show }">
+  <div id="autoDiscoveryModal" class="modal-overlay" :class="{ active: show }" role="dialog" aria-modal="true" :aria-label="trans.autoAdd">
     <div class="modal-dialog">
       <div class="modal-header">
         <div class="modal-title">{{ trans.autoAdd }}</div>
-        <button class="modal-close" @click="$emit('close')">✕</button>
+        <button type="button" class="modal-close" @click="$emit('close')">✕</button>
       </div>
 
       <div class="form-row">
@@ -93,13 +93,20 @@
       <div class="form-group">
         <div class="cmd-output-wrapper" :class="{ copied }">
           <span class="cmd-prompt">{{ targetOs === 'windows' ? 'PS' : '$' }}</span>
-          <pre class="cmd-output">{{ installCommand }}</pre>
+          <pre class="cmd-output">{{ showCommandSecret ? installCommand : maskedInstallCommand }}</pre>
+          <button
+            type="button"
+            class="password-toggle cmd-secret-toggle"
+            :aria-label="showCommandSecret ? trans.hideSecret : trans.showSecret"
+            :title="showCommandSecret ? trans.hideSecret : trans.showSecret"
+            @click="showCommandSecret = !showCommandSecret"
+          >{{ showCommandSecret ? '🙈' : '👁️' }}</button>
         </div>
       </div>
 
       <div class="modal-footer flex-justify-between">
-        <button @click="$emit('copy-cmd')" class="btn btn-primary">{{ copied ? '✅ ' + trans.copied : '📋 ' + trans.copy }}</button>
-        <button @click="$emit('close')" class="btn">{{ trans.cancel }}</button>
+        <button type="button" @click="$emit('copy-cmd')" class="btn btn-primary">{{ copied ? '✅ ' + trans.copied : '📋 ' + trans.copy }}</button>
+        <button type="button" @click="$emit('close')" class="btn">{{ trans.cancel }}</button>
       </div>
     </div>
   </div>
@@ -108,6 +115,8 @@
 <script setup>
 import { computed, ref, watch } from 'vue'
 import HelpTooltip from '../../../components/HelpTooltip.vue'
+import { useModal } from '../../../composables/useModal.js'
+import { maskCommandSecret } from '../../../utils/server.js'
 
 const props = defineProps({
   trans: { type: Object, required: true },
@@ -133,17 +142,22 @@ const emit = defineEmits([
   'update:gh-proxy'
 ])
 
+useModal(() => props.show, () => emit('close'))
+
+const showCommandSecret = ref(false)
+const maskedInstallCommand = computed(() => maskCommandSecret(props.installCommand))
+
 const CUSTOM_GH_PROXY_VALUE = '__custom__'
-const ghProxyOptions = [
+const ghProxyOptions = computed(() => [
   { value: '', label: props.trans.ghProxyPlaceholder || 'Direct' },
   { value: 'https://ghfast.top/', label: 'https://ghfast.top/' },
   { value: 'https://ghproxy.net/', label: 'https://ghproxy.net/' },
   { value: 'https://gh.llkk.cc/', label: 'https://gh.llkk.cc/' },
   { value: 'https://gh-proxy.com/', label: 'https://gh-proxy.com/' }
-]
+])
 
 const manualCustomGhProxy = ref(false)
-const isKnownGhProxy = (value) => ghProxyOptions.some(option => option.value === String(value || '').trim())
+const isKnownGhProxy = (value) => ghProxyOptions.value.some(option => option.value === String(value || '').trim())
 
 const selectedGhProxy = computed({
   get: () => {
@@ -171,7 +185,12 @@ const showCustomGhProxy = computed(() => selectedGhProxy.value === CUSTOM_GH_PRO
 watch(
   () => props.show,
   (show) => {
-    if (show && isKnownGhProxy(props.ghProxy)) {
+    if (!show) {
+      showCommandSecret.value = false
+      return
+    }
+    showCommandSecret.value = false
+    if (isKnownGhProxy(props.ghProxy)) {
       manualCustomGhProxy.value = false
     }
   }

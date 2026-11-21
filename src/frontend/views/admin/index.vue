@@ -34,7 +34,7 @@
             <span class="prompt">$</span> {{ trans.sudoStatus }}
           </div>
           <div class="header-actions">
-            <button @click="refreshServers" class="btn" :disabled="adminSiteLoading">↻ {{ trans.refresh }}</button>
+            <button type="button" @click="refreshServers" class="btn" :disabled="adminSiteLoading || refreshingServers">{{ refreshingServers ? '⏳' : '↻' }} {{ trans.refresh }}</button>
             <select
               v-if="isMultipleMode"
               v-model.number="selectedApiIndex"
@@ -115,6 +115,8 @@
           :selected-api-index="selectedApiIndex"
           :latest-agent-version="latestAgentVersion"
           :cache-refreshing="cacheRefreshing"
+          :adding-server="addingServer"
+          :deleting-server="deletingServer"
           :copied-server-id="copiedServerId"
           :copied-note-server-id="copiedNoteServerId"
           :copied-spec-key="copiedSpecKey"
@@ -165,6 +167,8 @@
           :db-loading="dbLoading"
           :selected-api-index="selectedApiIndex"
           @open-db-modal="openDbModal"
+          @servers-imported="loadServers"
+          @alert-message="alertMessage = $event"
         />
 
         <ThemeStorePanel
@@ -190,6 +194,7 @@
         v-model:edit-form="editForm"
         :current-server-name="currentServerName"
         :settings="settings"
+        :saving="editSaving"
         @save="saveEdit"
         @close="closeEditModal"
         @toggle-auto-update="handleAutoUpdateToggle"
@@ -208,11 +213,11 @@
         @close="closeBatchEditModal"
       />
 
-      <div v-if="showAutoUpdateWarning" id="autoUpdateWarningModal" class="modal-overlay auto-update-warning-modal active">
+      <div v-if="showAutoUpdateWarning" id="autoUpdateWarningModal" class="modal-overlay auto-update-warning-modal active" role="dialog" aria-modal="true" :aria-label="trans.autoUpdateRiskTitle">
         <div class="modal-dialog">
           <div class="modal-header">
             <div class="modal-title">{{ trans.autoUpdateRiskTitle }}</div>
-            <button class="modal-close" @click="cancelAutoUpdateWarning">✕</button>
+            <button type="button" class="modal-close" @click="cancelAutoUpdateWarning">✕</button>
           </div>
 
           <div class="danger-box mb-4">
@@ -226,8 +231,32 @@
           </div>
 
           <div class="modal-footer flex-justify-between">
-            <button @click="confirmAutoUpdateWarning" class="btn btn-primary">{{ trans.autoUpdateRiskConfirm }}</button>
-            <button @click="cancelAutoUpdateWarning" class="btn">{{ trans.autoUpdateRiskCancel }}</button>
+            <button type="button" @click="confirmAutoUpdateWarning" class="btn btn-primary">{{ trans.autoUpdateRiskConfirm }}</button>
+            <button type="button" @click="cancelAutoUpdateWarning" class="btn">{{ trans.autoUpdateRiskCancel }}</button>
+          </div>
+        </div>
+      </div>
+
+      <div v-if="showBatchDeleteConfirm" id="batchDeleteConfirmModal" class="modal-overlay confirm-modal-overlay active" role="dialog" aria-modal="true" :aria-label="trans.batchDelete">
+        <div class="modal-dialog">
+          <div class="modal-header">
+            <div class="modal-title">$ {{ trans.batchDelete }} [{{ selectedServers.length }}]</div>
+            <button type="button" class="modal-close" :disabled="deletingServer" @click="cancelBatchDeleteConfirm">✕</button>
+          </div>
+
+          <div class="danger-box mb-4">
+            <div class="flex-center-gap-sm mb-2">
+              <span class="danger-icon text-xl">⚠️</span>
+              <span class="danger-label">{{ trans.dangerWarning }}</span>
+            </div>
+            <p class="text-secondary text-sm line-height-1-6">
+              {{ trans.confirmDeleteServers }}{{ selectedServers.length }}{{ trans.irreversible }}
+            </p>
+          </div>
+
+          <div class="modal-footer flex-justify-between">
+            <button type="button" @click="executeBatchDelete" class="btn btn-red" :disabled="deletingServer">{{ deletingServer ? trans.deleting : trans.confirmDelete }}</button>
+            <button type="button" @click="cancelBatchDeleteConfirm" class="btn" :disabled="deletingServer">{{ trans.cancel }}</button>
           </div>
         </div>
       </div>
@@ -243,6 +272,7 @@
         :delete-gh-proxy="deleteGhProxy"
         :uninstall-command="getUninstallCommand()"
         :uninstall-copied="uninstallCopied"
+        :deleting="deletingServer"
         @close="closeDeleteModal"
         @confirm-delete="confirmDelete"
         @copy-uninstall="copyUninstallCmd"
@@ -311,11 +341,11 @@
         @update:gh-proxy="autoDiscoveryGhProxy = $event"
       />
 
-      <div id="dbModal" class="modal-overlay" :class="{ active: showDbModal }">
+      <div id="dbModal" class="modal-overlay" :class="{ active: showDbModal }" role="dialog" aria-modal="true" :aria-label="dbOperation === 'clearHistory' ? trans.clearHistory : trans.upgradeDatabase">
         <div class="modal-dialog">
           <div class="modal-header">
             <div class="modal-title">$ {{ dbOperation === 'clearHistory' ? 'CLEAR HISTORY' : 'ALTER DATABASE' }}</div>
-            <button class="modal-close" @click="closeDbModal" :disabled="dbLoading">✕</button>
+            <button type="button" class="modal-close" @click="closeDbModal" :disabled="dbLoading">✕</button>
           </div>
 
           <div v-if="dbOperation === 'clearHistory'" class="mb-4">
@@ -338,7 +368,7 @@
             </p>
           </div>
 
-          <div v-if="dbResult" :class="dbResult.success ? 'warning-box' : 'danger-box'" class="mb-4">
+          <div v-if="dbResult" :class="dbResult.success ? 'success-box' : 'danger-box'" class="mb-4">
             <div class="flex-center-gap-sm">
               <span :style="{ color: dbResult.success ? 'var(--accent-green)' : 'var(--accent-red)', fontWeight: '600' }">
                 {{ dbResult.success ? '✅' : '❌' }} {{ getMessage(dbResult.message) || (dbResult.success ? trans.operationSuccess : trans.operationFailed) }}
@@ -352,26 +382,27 @@
           <div v-if="!(dbResult && dbResult.success)" class="modal-footer flex-justify-between">
             <button
               v-if="!dbResult"
+              type="button"
               @click="dbOperation === 'clearHistory' ? handleClearHistory() : handleUpgradeDatabase()"
               class="btn btn-red"
               :disabled="dbLoading"
             >
               {{ dbLoading ? (dbOperation === 'clearHistory' ? trans.clearing : trans.upgrading) : (dbOperation === 'clearHistory' ? trans.confirmClear : trans.upgradeDatabase) }}
             </button>
-            <button @click="closeDbModal" class="btn" :disabled="dbLoading">{{ trans.cancel }}</button>
+            <button type="button" @click="closeDbModal" class="btn" :disabled="dbLoading">{{ trans.cancel }}</button>
           </div>
         </div>
       </div>
 
-      <div v-if="d1UsageResult" id="d1UsageModal" class="modal-overlay active">
+      <div v-if="d1UsageResult" id="d1UsageModal" class="modal-overlay active" role="dialog" aria-modal="true" :aria-label="trans.queryD1Quota">
         <div class="modal-dialog">
           <div class="modal-header">
             <div class="modal-title">$ D1, Workers & Durable Objects quota --utc</div>
-            <button class="modal-close" @click="d1UsageResult = null">✕</button>
+            <button type="button" class="modal-close" @click="d1UsageResult = null">✕</button>
           </div>
 
           <div v-if="d1UsageResult.success" class="mb-4">
-            <div class="warning-box mb-4">
+            <div class="success-box mb-4">
               {{ getMessage(d1UsageResult.message) || trans.d1UsageQueried }}
             </div>
             <div class="quota-section">
@@ -379,7 +410,7 @@
               <div class="quota-progress-list">
                 <div class="quota-progress-item">
                   <div class="flex-justify-between text-sm mb-1">
-                    <span>{{ trans.d1RowsRead }}：{{ formatNumber(d1UsageResult.usage.today.rowsRead) }} / {{ formatNumber(5000000) }}</span>
+                    <span>{{ trans.d1RowsRead }}: {{ formatNumber(d1UsageResult.usage.today.rowsRead) }} / {{ formatNumber(5000000) }}</span>
                     <span>{{ getUsagePercent(d1UsageResult.usage.today.rowsRead, 5000000) }}%</span>
                   </div>
                   <div class="quota-progress-bar">
@@ -388,7 +419,7 @@
                 </div>
                 <div class="quota-progress-item">
                   <div class="flex-justify-between text-sm mb-1">
-                    <span>{{ trans.d1RowsWritten }}：{{ formatNumber(d1UsageResult.usage.today.rowsWritten) }} / {{ formatNumber(100000) }}</span>
+                    <span>{{ trans.d1RowsWritten }}: {{ formatNumber(d1UsageResult.usage.today.rowsWritten) }} / {{ formatNumber(100000) }}</span>
                     <span>{{ getUsagePercent(d1UsageResult.usage.today.rowsWritten, 100000) }}%</span>
                   </div>
                   <div class="quota-progress-bar">
@@ -397,7 +428,7 @@
                 </div>
                 <div class="quota-progress-item">
                   <div class="flex-justify-between text-sm mb-1">
-                    <span>{{ trans.workersRequests }}：{{ formatNumber(d1UsageResult.usage.today.workersRequests) }} / {{ formatNumber(100000) }}</span>
+                    <span>{{ trans.workersRequests }}: {{ formatNumber(d1UsageResult.usage.today.workersRequests) }} / {{ formatNumber(100000) }}</span>
                     <span>{{ getUsagePercent(d1UsageResult.usage.today.workersRequests, 100000) }}%</span>
                   </div>
                   <div v-if="d1UsageResult.usage.today.workersRequests" class="quota-progress-bar">
@@ -407,7 +438,7 @@
                 <div class="quota-progress-item">
                   <div class="flex-justify-between text-sm mb-1">
                     <span class="quota-label-with-help">
-                      <span>{{ trans.durableObjectsRequests }}：{{ formatNumber(d1UsageResult.usage.today.durableObjectsRequests) }} / {{ formatNumber(100000) }}</span>
+                      <span>{{ trans.durableObjectsRequests }}: {{ formatNumber(d1UsageResult.usage.today.durableObjectsRequests) }} / {{ formatNumber(100000) }}</span>
                       <HelpTooltip>
                         <template #default>
                           <span v-for="row in getDurableObjectsUsageRows(d1UsageResult.usage.today)" :key="row.key" class="quota-help-row">
@@ -426,7 +457,7 @@
                 <div class="quota-progress-item">
                   <div class="flex-justify-between text-sm mb-1">
                     <span class="quota-label-with-help">
-                      <span>{{ trans.durableObjectsDuration }}：{{ formatNumber(d1UsageResult.usage.today.durableObjectsDuration, 2) }} / {{ formatNumber(13000) }}</span>
+                      <span>{{ trans.durableObjectsDuration }}: {{ formatNumber(d1UsageResult.usage.today.durableObjectsDuration, 2) }} / {{ formatNumber(13000) }}</span>
                       <HelpTooltip :text="trans.durableObjectsDurationTip">
                         <template #default>
                           <span class="quota-help-row">{{ trans.durableObjectsDurationTip }}</span>
@@ -447,7 +478,7 @@
               <div class="quota-progress-list">
                 <div class="quota-progress-item">
                   <div class="flex-justify-between text-sm mb-1">
-                    <span>{{ trans.d1RowsRead }}：{{ formatNumber(d1UsageResult.usage.yesterday.rowsRead) }} / {{ formatNumber(5000000) }}</span>
+                    <span>{{ trans.d1RowsRead }}: {{ formatNumber(d1UsageResult.usage.yesterday.rowsRead) }} / {{ formatNumber(5000000) }}</span>
                     <span>{{ getUsagePercent(d1UsageResult.usage.yesterday.rowsRead, 5000000) }}%</span>
                   </div>
                   <div class="quota-progress-bar">
@@ -456,7 +487,7 @@
                 </div>
                 <div class="quota-progress-item">
                   <div class="flex-justify-between text-sm mb-1">
-                    <span>{{ trans.d1RowsWritten }}：{{ formatNumber(d1UsageResult.usage.yesterday.rowsWritten) }} / {{ formatNumber(100000) }}</span>
+                    <span>{{ trans.d1RowsWritten }}: {{ formatNumber(d1UsageResult.usage.yesterday.rowsWritten) }} / {{ formatNumber(100000) }}</span>
                     <span>{{ getUsagePercent(d1UsageResult.usage.yesterday.rowsWritten, 100000) }}%</span>
                   </div>
                   <div class="quota-progress-bar">
@@ -465,7 +496,7 @@
                 </div>
                 <div v-if="d1UsageResult.usage.yesterday.workersRequests" class="quota-progress-item">
                   <div class="flex-justify-between text-sm mb-1">
-                    <span>{{ trans.workersRequests }}：{{ formatNumber(d1UsageResult.usage.yesterday.workersRequests) }} / {{ formatNumber(100000) }}</span>
+                    <span>{{ trans.workersRequests }}: {{ formatNumber(d1UsageResult.usage.yesterday.workersRequests) }} / {{ formatNumber(100000) }}</span>
                     <span>{{ getUsagePercent(d1UsageResult.usage.yesterday.workersRequests, 100000) }}%</span>
                   </div>
                   <div class="quota-progress-bar">
@@ -475,7 +506,7 @@
                 <div class="quota-progress-item">
                   <div class="flex-justify-between text-sm mb-1">
                     <span class="quota-label-with-help">
-                      <span>{{ trans.durableObjectsRequests }}：{{ formatNumber(d1UsageResult.usage.yesterday.durableObjectsRequests) }} / {{ formatNumber(100000) }}</span>
+                      <span>{{ trans.durableObjectsRequests }}: {{ formatNumber(d1UsageResult.usage.yesterday.durableObjectsRequests) }} / {{ formatNumber(100000) }}</span>
                       <HelpTooltip>
                         <template #default>
                           <span v-for="row in getDurableObjectsUsageRows(d1UsageResult.usage.yesterday)" :key="row.key" class="quota-help-row">
@@ -494,7 +525,7 @@
                 <div class="quota-progress-item">
                   <div class="flex-justify-between text-sm mb-1">
                     <span class="quota-label-with-help">
-                      <span>{{ trans.durableObjectsDuration }}：{{ formatNumber(d1UsageResult.usage.yesterday.durableObjectsDuration, 2) }} / {{ formatNumber(13000) }}</span>
+                      <span>{{ trans.durableObjectsDuration }}: {{ formatNumber(d1UsageResult.usage.yesterday.durableObjectsDuration, 2) }} / {{ formatNumber(13000) }}</span>
                       <HelpTooltip :text="trans.durableObjectsDurationTip">
                         <template #default>
                           <span class="quota-help-row">{{ trans.durableObjectsDurationTip }}</span>
@@ -517,16 +548,16 @@
 
           <div class="modal-footer flex-justify-between">
             <div></div>
-            <button @click="d1UsageResult = null" class="btn">{{ trans.close }}</button>
+            <button type="button" @click="d1UsageResult = null" class="btn">{{ trans.close }}</button>
           </div>
         </div>
       </div>
 
-      <div v-if="validationError" id="validationErrorModal" class="modal-overlay active">
+      <div v-if="validationError" id="validationErrorModal" class="modal-overlay modal-overlay-top active" role="dialog" aria-modal="true" :aria-label="trans.validationError">
         <div class="modal-dialog">
           <div class="modal-header">
             <div class="modal-title">$ {{ trans.validationError }}</div>
-            <button class="modal-close" @click="validationError = null">✕</button>
+            <button type="button" class="modal-close" @click="validationError = null">✕</button>
           </div>
 
           <div class="danger-box mb-4">
@@ -538,16 +569,16 @@
 
           <div class="modal-footer flex-justify-between">
             <div></div>
-            <button @click="validationError = null" class="btn">{{ trans.close }}</button>
+            <button type="button" @click="validationError = null" class="btn">{{ trans.close }}</button>
           </div>
         </div>
       </div>
 
-      <div v-if="saveResult" class="modal-overlay active">
+      <div v-if="saveResult" class="modal-overlay modal-overlay-top active" role="dialog" aria-modal="true" aria-label="save result">
         <div class="modal-dialog">
           <div class="modal-header">
             <div class="modal-title">$ save --result</div>
-            <button class="modal-close" @click="saveResult = null">✕</button>
+            <button type="button" class="modal-close" @click="saveResult = null">✕</button>
           </div>
 
           <div v-if="saveResult.success" class="success-box mb-4">
@@ -566,16 +597,16 @@
 
           <div class="modal-footer flex-justify-between">
             <div></div>
-            <button @click="saveResult = null" class="btn">{{ trans.close }}</button>
+            <button type="button" @click="saveResult = null" class="btn">{{ trans.close }}</button>
           </div>
         </div>
       </div>
 
-      <div v-if="alertMessage" class="modal-overlay active">
+      <div v-if="alertMessage" class="modal-overlay modal-overlay-top active" role="dialog" aria-modal="true" aria-label="alert">
         <div class="modal-dialog">
           <div class="modal-header">
             <div class="modal-title">$ alert</div>
-            <button class="modal-close" @click="alertMessage = null">✕</button>
+            <button type="button" class="modal-close" @click="alertMessage = null">✕</button>
           </div>
 
           <div class="mb-4">
@@ -584,7 +615,7 @@
 
           <div class="modal-footer flex-justify-between">
             <div></div>
-            <button @click="alertMessage = null" class="btn">{{ trans.close }}</button>
+            <button type="button" @click="alertMessage = null" class="btn">{{ trans.close }}</button>
           </div>
         </div>
       </div>
@@ -619,9 +650,28 @@ import { PING_NODE_FIELDS, validatePingNode } from '../../utils/pingNode.js'
 import { normalizeDisplayMode, resolveDisplayMode } from '../../utils/displayMode.js'
 import { applyMikusThemeOptions } from '../../utils/themeOptions.js'
 import { FRONTEND_WS_TIMEOUT_MINUTES_MAX, HISTORY, STORAGE } from '../../utils/constants.js'
+import { safeLocalStorage } from '../../utils/storage.js'
+import { useModal } from '../../composables/useModal.js'
 import { usePasswordVisibility } from '../../composables/usePasswordVisibility'
 import { useTurnstile } from './composables/useTurnstile'
-import { detectBillingCycle, detectCurrencySymbol, normalizeBillingCycle, normalizeCurrency, normalizePrice, renewExpireDateIfNeeded } from '../../utils/server.js'
+import {
+  detectBillingCycle,
+  detectCurrencySymbol,
+  getLocalizedPingNodeLabel,
+  normalizeBillingCycle,
+  normalizeCurrency,
+  normalizePrice,
+  renewExpireDateIfNeeded,
+  resolveCustomPingNodeName,
+  resolveSafeLoginRedirect,
+  validateNetworkInterfaceInput,
+  validatePriceInput,
+  validateResourceAlertThresholdInput,
+  validateServerNameInput,
+  validateTrafficAlertPercentInput,
+  validateTrafficCorrectionInput,
+  validateTrafficLimitInput
+} from '../../utils/server.js'
 
 const trans = useTranslation()
 const route = useRoute()
@@ -993,10 +1043,18 @@ const settings = ref({
   custom_cu: '',
   custom_cm: '',
   custom_bd: '',
-  custom_ct_name: '电信',
-  custom_cu_name: '联通',
-  custom_cm_name: '移动',
-  custom_bd_name: 'BGP',
+  node_1: '',
+  node_2: '',
+  node_3: '',
+  node_4: '',
+  custom_ct_name: '',
+  custom_cu_name: '',
+  custom_cm_name: '',
+  custom_bd_name: '',
+  node_1_name: '',
+  node_2_name: '',
+  node_3_name: '',
+  node_4_name: '',
   theme_url: '',
   csp_static: '',
   csp_api: '',
@@ -1119,6 +1177,10 @@ const deleteInstallMode = ref('current-user')
 const deleteGhProxy = ref('')
 const uninstallCopied = ref(false)
 const saving = ref(false)
+const addingServer = ref(false)
+const editSaving = ref(false)
+const deletingServer = ref(false)
+const refreshingServers = ref(false)
 
 
 const showDbModal = ref(false)
@@ -1131,6 +1193,9 @@ const validationError = ref(null)
 const alertMessage = ref(null)
 const showAutoUpdateWarning = ref(false)
 const autoUpdatePendingEnable = ref(false)
+const autoUpdateWarningSource = ref('edit')
+const pendingBatchTasks = ref([])
+const showBatchDeleteConfirm = ref(false)
 
 const testNotificationLoading = ref(false)
 
@@ -1189,13 +1254,7 @@ watch(isWssReportEnabled, (enabled) => {
   }
 })
 
-const getPingNodeLabel = (field) => ({
-  custom_ct: settings.value.custom_ct_name || trans.value.customCt,
-  custom_cu: settings.value.custom_cu_name || trans.value.customCu,
-  custom_cm: settings.value.custom_cm_name || trans.value.customCm,
-  custom_bd: settings.value.custom_bd_name || trans.value.customBd
-  ,node_1: settings.value.node_1_name || 'Node 1', node_2: settings.value.node_2_name || 'Node 2', node_3: settings.value.node_3_name || 'Node 3', node_4: settings.value.node_4_name || 'Node 4'
-})[field] || field
+const getPingNodeLabel = (field) => getLocalizedPingNodeLabel(field, settings.value, trans.value)
 
 const getPingNodeValidation = (source) => {
   const values = {}
@@ -1253,40 +1312,55 @@ const copyServerSpec = async ({ key, text } = {}) => {
   }
 }
 
+const safeGetStorage = (key) => safeLocalStorage.getItem(key)
+
+const safeSetStorage = (key, value) => {
+  safeLocalStorage.setItem(key, value)
+}
+
 const handleLogin = async () => {
+  if (loginLoading.value) return
   loginError.value = ''
   loginLoading.value = true
 
-  if (turnstileLoginEnabled.value && !turnstileToken.value) {
-    loginError.value = 'Please complete the verification'
-    loginLoading.value = false
-    return
-  }
+  try {
+    if (turnstileLoginEnabled.value && !turnstileToken.value) {
+      loginError.value = trans.value.pleaseCompleteVerification
+      return
+    }
 
-  if (turnstileEnabled.value && !turnstileVerified.value && !turnstileToken.value) {
-    loginError.value = 'Please complete the verification'
-    loginLoading.value = false
-    return
-  }
+    if (turnstileEnabled.value && !turnstileVerified.value && !turnstileToken.value) {
+      loginError.value = trans.value.pleaseCompleteVerification
+      return
+    }
 
-  const result = await login(loginForm.value.username, loginForm.value.password, turnstileToken.value, selectedApiIndex.value)
-  if (!result.error) {
-    isLoggedIn.value = true
-    syncApiIndexQuery()
-    clearTurnstile()
-    turnstileVerified.value = hasSharedTurnstileVerified()
-    await Promise.all([
-      loadSettings(),
-      loadServers(),
-      loadLatestAgentVersion()
-    ])
-  } else {
-    loginError.value = result.status === 403 ? 'Please complete the verification' : trans.value.errorInvalidUsername
-    loginForm.value.password = ''
-    clearTurnstile()
-    resetTurnstile('#admin-turnstile-container')
+    const result = await login(loginForm.value.username, loginForm.value.password, turnstileToken.value, selectedApiIndex.value)
+    if (!result.error) {
+      isLoggedIn.value = true
+      clearTurnstile()
+      turnstileVerified.value = hasSharedTurnstileVerified()
+
+      const safeRedirect = resolveSafeLoginRedirect(route.query.redirect)
+      if (safeRedirect) {
+        await router.push(safeRedirect)
+        return
+      }
+
+      syncApiIndexQuery()
+      await Promise.all([
+        loadSettings(),
+        loadServers(),
+        loadLatestAgentVersion()
+      ])
+    } else {
+      loginError.value = result.status === 403 ? trans.value.pleaseCompleteVerification : trans.value.errorInvalidUsername
+      loginForm.value.password = ''
+      clearTurnstile()
+      resetTurnstile('#admin-turnstile-container')
+    }
+  } finally {
+    loginLoading.value = false
   }
-  loginLoading.value = false
 }
 
 const logout = async () => {
@@ -1303,7 +1377,7 @@ const logout = async () => {
 }
 
 const checkLoginStatus = () => {
-  const token = localStorage.getItem(STORAGE.JWT_TOKEN)
+  const token = safeGetStorage(STORAGE.JWT_TOKEN)
   return !!token || appConfig?.authorization === true
 }
 
@@ -1312,7 +1386,7 @@ const initAdmin = async () => {
   if (hasCreds) {
     isLoggedIn.value = true
     syncApiIndexQuery()
-    const savedTurnstileToken = localStorage.getItem(STORAGE.TURNSTILE_TOKEN)
+    const savedTurnstileToken = safeGetStorage(STORAGE.TURNSTILE_TOKEN)
     if (savedTurnstileToken) {
       turnstileToken.value = savedTurnstileToken
     }
@@ -1344,6 +1418,11 @@ const handleApiIndexChange = async (newIndex) => {
 const resetAdminContext = () => {
   selectedServers.value = []
   showEditModal.value = false
+  showBatchEditModal.value = false
+  showAutoDiscoveryModal.value = false
+  showAutoUpdateWarning.value = false
+  showBatchDeleteConfirm.value = false
+  pendingBatchTasks.value = []
   showDeleteModal.value = false
   showCopyModal.value = false
   showDbModal.value = false
@@ -1386,6 +1465,41 @@ const loadLatestAgentVersion = async () => {
   } catch (e) {
     console.error('[ERROR] Load latest agent version failed:', e)
     latestAgentVersion.value = await fetchLatestAgentReleaseVersion()
+  }
+}
+
+const syncInjectedAppConfig = (settingsSource, themeOptions = undefined) => {
+  if (!appConfig || typeof appConfig !== 'object' || !settingsSource) return
+  const normalizedNames = {
+    custom_ct_name: resolveCustomPingNodeName('custom_ct_name', settingsSource.custom_ct_name),
+    custom_cu_name: resolveCustomPingNodeName('custom_cu_name', settingsSource.custom_cu_name),
+    custom_cm_name: resolveCustomPingNodeName('custom_cm_name', settingsSource.custom_cm_name),
+    custom_bd_name: resolveCustomPingNodeName('custom_bd_name', settingsSource.custom_bd_name),
+    node_1_name: resolveCustomPingNodeName('node_1_name', settingsSource.node_1_name),
+    node_2_name: resolveCustomPingNodeName('node_2_name', settingsSource.node_2_name),
+    node_3_name: resolveCustomPingNodeName('node_3_name', settingsSource.node_3_name),
+    node_4_name: resolveCustomPingNodeName('node_4_name', settingsSource.node_4_name)
+  }
+  const extraUpdates = {
+    site_title: settingsSource.site_title ?? '',
+    display_mode: normalizeDisplayMode(settingsSource.display_mode),
+    frontend_ws_timeout_minutes: Number(settingsSource.frontend_ws_timeout_minutes) || 0
+  }
+  if (themeOptions !== undefined) {
+    extraUpdates.theme_options = themeOptions
+  }
+
+  if (Array.isArray(appConfig.site_configs)) {
+    const existing = appConfig.site_configs[selectedApiIndex.value]
+    appConfig.site_configs[selectedApiIndex.value] = {
+      ...(existing && typeof existing === 'object' ? existing : {}),
+      ...normalizedNames,
+      ...extraUpdates,
+      __updatedByAdminAt: Date.now()
+    }
+  }
+  if (selectedApiIndex.value === 0) {
+    Object.assign(appConfig, normalizedNames, extraUpdates, { __updatedByAdminAt: Date.now() })
   }
 }
 
@@ -1448,17 +1562,21 @@ const loadSettings = async () => {
         custom_cm: settingsData.custom_cm || '',
         custom_bd: settingsData.custom_bd || '',
         node_1: settingsData.node_1 || '', node_2: settingsData.node_2 || '', node_3: settingsData.node_3 || '', node_4: settingsData.node_4 || '',
-        custom_ct_name: settingsData.custom_ct_name || '电信',
-        custom_cu_name: settingsData.custom_cu_name || '联通',
-        custom_cm_name: settingsData.custom_cm_name || '移动',
-        custom_bd_name: settingsData.custom_bd_name || 'BGP',
-        node_1_name: settingsData.node_1_name || 'Node 1', node_2_name: settingsData.node_2_name || 'Node 2', node_3_name: settingsData.node_3_name || 'Node 3', node_4_name: settingsData.node_4_name || 'Node 4',
+        custom_ct_name: resolveCustomPingNodeName('custom_ct_name', settingsData.custom_ct_name),
+        custom_cu_name: resolveCustomPingNodeName('custom_cu_name', settingsData.custom_cu_name),
+        custom_cm_name: resolveCustomPingNodeName('custom_cm_name', settingsData.custom_cm_name),
+        custom_bd_name: resolveCustomPingNodeName('custom_bd_name', settingsData.custom_bd_name),
+        node_1_name: resolveCustomPingNodeName('node_1_name', settingsData.node_1_name),
+        node_2_name: resolveCustomPingNodeName('node_2_name', settingsData.node_2_name),
+        node_3_name: resolveCustomPingNodeName('node_3_name', settingsData.node_3_name),
+        node_4_name: resolveCustomPingNodeName('node_4_name', settingsData.node_4_name),
         theme_url: settingsData.theme_url || '',
         csp_static: settingsData.csp_static || '',
         csp_api: settingsData.csp_api || '',
         ua: settingsData.ua || 'cfsm'
       }
       applyMikusThemeOptions(settingsData.theme_options)
+      syncInjectedAppConfig(settings.value, settingsData.theme_options)
       changeAdminPassword.value = !settings.value.password_configured || !String(settings.value.username || '').trim()
       apiSecret.value = data.api_secret || ''
       // 只有已保存到服务端的自动发现开关才提供复制安装命令，避免复制出当前并未生效的命令
@@ -1525,17 +1643,40 @@ const saveSettings = async () => {
     return
   }
 
-  const shouldChangePassword = changeAdminPassword.value && (
-    settings.value.password.length > 0 ||
-    settings.value.confirm_password.length > 0
-  )
-
-  if (!settings.value.password_configured && !shouldChangePassword) {
-    changeAdminPassword.value = true
-    validationError.value = trans.value.passwordRequired
+  const trafficAlertThresholdCheck = validateTrafficAlertPercentInput(settings.value.traffic_alert_threshold, { allowEmpty: true })
+  if (!trafficAlertThresholdCheck.valid) {
+    validationError.value = trans.value.invalidTrafficAlertPercent
     return
   }
 
+  const rawRules = Array.isArray(settings.value.resource_alert_rules) ? settings.value.resource_alert_rules : []
+  if (rawRules.length > 20) {
+    validationError.value = trans.value.resourceAlertMaxRulesHint
+    return
+  }
+  for (const rule of rawRules) {
+    const metric = normalizeResourceAlertMetricSetting(rule?.metric)
+    const thresholdCheck = validateResourceAlertThresholdInput(rule?.threshold, metric)
+    if (!thresholdCheck.valid) {
+      validationError.value = trans.value.invalidResourceAlertThreshold
+      return
+    }
+  }
+
+  if (!settings.value.password_configured) {
+    changeAdminPassword.value = true
+    if (!settings.value.password || settings.value.password.trim().length === 0) {
+      validationError.value = trans.value.passwordRequired
+      return
+    }
+  } else if (changeAdminPassword.value) {
+    if (!settings.value.password || settings.value.password.trim().length === 0) {
+      validationError.value = trans.value.newPasswordRequired
+      return
+    }
+  }
+
+  const shouldChangePassword = changeAdminPassword.value
   if (shouldChangePassword) {
     if (settings.value.password !== settings.value.confirm_password) {
       validationError.value = trans.value.passwordMismatch
@@ -1621,7 +1762,7 @@ const saveSettings = async () => {
       tg_notify: normalizeTgNotifySetting(settings.value.tg_notify),
       expire_reminder: normalizeExpireReminderSetting(settings.value.expire_reminder),
       resource_alert_rules: normalizeResourceAlertRulesSetting(settings.value.resource_alert_rules),
-      traffic_alert_threshold: String(Math.max(0, Math.min(100, Number(settings.value.traffic_alert_threshold) || 0))),
+      traffic_alert_threshold: String(trafficAlertThresholdCheck.value ?? 0),
       tg_bot_token: settings.value.tg_bot_token,
       tg_chat_id: settings.value.tg_chat_id,
       notification_timezone: normalizeNotificationTimezoneSetting(settings.value.notification_timezone),
@@ -1668,12 +1809,17 @@ const saveSettings = async () => {
   try {
     const result = await adminApiForSite(data)
     if (!result.error) {
+      const renewedToken = result.data?.token || result.token
+      if (typeof renewedToken === 'string' && renewedToken.trim()) {
+        safeSetStorage(STORAGE.JWT_TOKEN, renewedToken.trim())
+      }
       saveResult.value = { success: true }
       applyMikusThemeOptions(themeOptionsResult.value)
+      syncInjectedAppConfig(data.settings, themeOptionsResult.value)
       clearAdminPasswordInputs()
       changeAdminPassword.value = false
       settings.value.jwt_secret = ''
-      loadSettings()
+      await loadSettings()
     } else {
       saveResult.value = { success: false, error: getMessage(result.error) || 'fail' }
     }
@@ -1720,31 +1866,46 @@ const refreshServersCache = async () => {
 }
 
 const refreshServers = async () => {
-  await Promise.all([
-    loadServers(),
-    loadLatestAgentVersion()
-  ])
+  if (refreshingServers.value) return
+  refreshingServers.value = true
+  try {
+    await Promise.all([
+      loadServers(),
+      loadLatestAgentVersion()
+    ])
+  } finally {
+    refreshingServers.value = false
+  }
 }
 
 const addServer = async () => {
-  const name = newServerName.value.trim()
-  if (!name) {
+  if (addingServer.value) return
+  const rawName = String(newServerName.value ?? '')
+  if (!rawName.trim()) {
     validationError.value = trans.value.enterServerName
     return
   }
+  const nameCheck = validateServerNameInput(rawName)
+  if (!nameCheck.valid) {
+    validationError.value = trans.value.invalidServerName
+    return
+  }
 
+  addingServer.value = true
   try {
-    const result = await adminApiForSite({ action: 'add', name, server_group: newServerGroup.value })
+    const result = await adminApiForSite({ action: 'add', name: nameCheck.value, server_group: newServerGroup.value })
     if (!result.error) {
       saveResult.value = { success: true, message: getMessage(result.data.message) || trans.value.serverAdded }
       newServerName.value = ''
       newServerGroup.value = ''
-      loadServers()
+      await loadServers()
     } else {
       saveResult.value = { success: false, error: getMessage(result.error) || 'Fail' }
     }
   } catch (e) {
     saveResult.value = { success: false, error: e.message }
+  } finally {
+    addingServer.value = false
   }
 }
 
@@ -1784,7 +1945,8 @@ const getUninstallCommand = () => {
   if (deleteTargetOs.value === 'windows') {
     return `$script = Join-Path (Get-Location) 'uninstall-cf-probe.ps1'; Invoke-WebRequest -Uri '${HOST}/uninstall.ps1' -OutFile $script -UseBasicParsing; PowerShell -ExecutionPolicy Bypass -File $script`
   }
-  return `curl -fsSL '${HOST}/uninstall.sh' | sh -s`
+  const sudoPrefix = deleteTargetOs.value === 'mac' ? 'sudo ' : ''
+  return `curl -fsSL '${HOST}/uninstall.sh' | ${sudoPrefix}sh -s -- -y`
 }
 
 const copyCmd = (serverId) => {
@@ -2134,6 +2296,7 @@ const openEditModal = (server) => {
 }
 
 const closeEditModal = () => {
+  if (editSaving.value) return
   cancelAutoUpdateWarning()
   showEditModal.value = false
 }
@@ -2144,32 +2307,116 @@ const handleAutoUpdateToggle = (nextValue) => {
     cancelAutoUpdateWarning()
     return
   }
+  autoUpdateWarningSource.value = 'edit'
   autoUpdatePendingEnable.value = true
   showAutoUpdateWarning.value = true
 }
 
-const confirmAutoUpdateWarning = () => {
-  if (autoUpdatePendingEnable.value) {
+const confirmAutoUpdateWarning = async () => {
+  const source = autoUpdateWarningSource.value
+  if (source === 'edit' && autoUpdatePendingEnable.value) {
     editForm.value.auto_update = true
   }
   autoUpdatePendingEnable.value = false
   showAutoUpdateWarning.value = false
+
+  if (source === 'batch' && pendingBatchTasks.value.length > 0) {
+    const tasks = pendingBatchTasks.value
+    pendingBatchTasks.value = []
+    await executeBatchEditTasks(tasks)
+  }
 }
 
 const cancelAutoUpdateWarning = () => {
   autoUpdatePendingEnable.value = false
+  pendingBatchTasks.value = []
   showAutoUpdateWarning.value = false
 }
 
+const validateServerFormFields = (form, checkFields = null) => {
+  const shouldCheck = (field) => !checkFields || checkFields.has(field)
+
+  if (shouldCheck('name')) {
+    const nameCheck = validateServerNameInput(form.name)
+    if (!nameCheck.valid) {
+      return { valid: false, error: trans.value.invalidServerName }
+    }
+  }
+
+  if (shouldCheck('price')) {
+    const priceCheck = validatePriceInput(form.price)
+    if (!priceCheck.valid) {
+      return { valid: false, error: trans.value.invalidPrice }
+    }
+  }
+
+  if (shouldCheck('traffic_limit')) {
+    const limitCheck = validateTrafficLimitInput(form.traffic_limit)
+    if (!limitCheck.valid) {
+      return { valid: false, error: trans.value.invalidTrafficLimit }
+    }
+  }
+
+  if (shouldCheck('traffic_alert_percent')) {
+    const alertCheck = validateTrafficAlertPercentInput(form.traffic_alert_percent, { allowEmpty: true })
+    if (!alertCheck.valid) {
+      return { valid: false, error: trans.value.invalidTrafficAlertPercent }
+    }
+  }
+
+  if (shouldCheck('rx_correction')) {
+    const rxCheck = validateTrafficCorrectionInput(form.rx_correction)
+    if (!rxCheck.valid) {
+      return { valid: false, error: trans.value.invalidTrafficCorrection }
+    }
+  }
+
+  if (shouldCheck('tx_correction')) {
+    const txCheck = validateTrafficCorrectionInput(form.tx_correction)
+    if (!txCheck.valid) {
+      return { valid: false, error: trans.value.invalidTrafficCorrection }
+    }
+  }
+
+  if (shouldCheck('interface')) {
+    const ifaceCheck = validateNetworkInterfaceInput(form.interface)
+    if (!ifaceCheck.valid) {
+      return { valid: false, error: trans.value.invalidNetworkInterface }
+    }
+  }
+
+  for (const field of PING_NODE_FIELDS) {
+    if (!shouldCheck(field)) continue
+    const result = validatePingNode(form[field])
+    if (!result.valid) {
+      return { valid: false, error: buildPingNodeError(field) }
+    }
+  }
+
+  return { valid: true }
+}
+
 const buildEditPayloadFromForm = (form) => {
+  const fieldValidation = validateServerFormFields(form)
+  if (!fieldValidation.valid) {
+    return { error: fieldValidation.error }
+  }
+
   const pingNodeValidation = getPingNodeValidation(form)
   if (!pingNodeValidation.valid) {
     return { error: buildPingNodeError(pingNodeValidation.field) }
   }
 
+  const nameCheck = validateServerNameInput(form.name)
+  const priceCheck = validatePriceInput(form.price)
+  const limitCheck = validateTrafficLimitInput(form.traffic_limit)
+  const alertCheck = validateTrafficAlertPercentInput(form.traffic_alert_percent, { allowEmpty: true })
+  const ifaceCheck = validateNetworkInterfaceInput(form.interface)
+  const rxCheck = validateTrafficCorrectionInput(form.rx_correction)
+  const txCheck = validateTrafficCorrectionInput(form.tx_correction)
   const normalizedBillingCycle = normalizeBillingCycle(form.billing_cycle)
   const normalizedAutoRenewal = form.auto_renewal ? '1' : '0'
-  const normalizedPrice = normalizePrice(form.price)
+  const normalizedPrice = priceCheck.value
   const normalizedCurrency = normalizeCurrency(form.currency || detectCurrencySymbol(form.price) || '¥')
   const normalizedExpireDate = renewExpireDateIfNeeded(
     form.expire_date,
@@ -2181,7 +2428,7 @@ const buildEditPayloadFromForm = (form) => {
     payload: {
       action: 'edit',
       id: form.id,
-      name: form.name,
+      name: nameCheck.value,
       server_group: form.server_group,
       region: form.region,
       tags: form.tags,
@@ -2191,10 +2438,10 @@ const buildEditPayloadFromForm = (form) => {
       auto_renewal: normalizedAutoRenewal,
       currency: normalizedCurrency,
       expire_date: normalizedExpireDate,
-      traffic_limit: form.traffic_limit,
+      traffic_limit: limitCheck.value,
       traffic_calc_type: form.traffic_calc_type,
-      traffic_alert_percent: normalizeTrafficAlertPercentField(form.traffic_alert_percent),
-      interface: form.interface,
+      traffic_alert_percent: alertCheck.value,
+      interface: ifaceCheck.value,
       reset_day: form.reset_day,
       collect_interval: form.collect_interval,
       report_interval: form.report_interval,
@@ -2206,8 +2453,8 @@ const buildEditPayloadFromForm = (form) => {
       custom_cm: pingNodeValidation.values.custom_cm,
       custom_bd: pingNodeValidation.values.custom_bd,
       node_1: pingNodeValidation.values.node_1, node_2: pingNodeValidation.values.node_2, node_3: pingNodeValidation.values.node_3, node_4: pingNodeValidation.values.node_4,
-      rx_correction: form.rx_correction,
-      tx_correction: form.tx_correction,
+      rx_correction: rxCheck.value,
+      tx_correction: txCheck.value,
       auto_update: form.auto_update ? '1' : '0',
       is_hidden: form.is_hidden ? '1' : '0',
       offline_notify_disabled: form.offline_notify_disabled ? '1' : '0'
@@ -2222,76 +2469,35 @@ const buildEditPayloadFromForm = (form) => {
 }
 
 const saveEdit = async () => {
+  if (editSaving.value) return
   validationError.value = null
 
-  const pingNodeValidation = getPingNodeValidation(editForm.value)
-  if (!pingNodeValidation.valid) {
-    validationError.value = buildPingNodeError(pingNodeValidation.field)
+  const built = buildEditPayloadFromForm(editForm.value)
+  if (built.error) {
+    validationError.value = built.error
     return
   }
 
-  const normalizedBillingCycle = normalizeBillingCycle(editForm.value.billing_cycle)
-  const normalizedAutoRenewal = editForm.value.auto_renewal ? '1' : '0'
-  const normalizedPrice = normalizePrice(editForm.value.price)
-  const normalizedCurrency = normalizeCurrency(editForm.value.currency || detectCurrencySymbol(editForm.value.price) || '¥')
-  const normalizedExpireDate = renewExpireDateIfNeeded(
-    editForm.value.expire_date,
-    normalizedBillingCycle,
-    normalizedAutoRenewal
-  ).expire_date
+  editForm.value.price = built.normalized.price
+  editForm.value.currency = built.normalized.currency
+  editForm.value.billing_cycle = built.normalized.billing_cycle
+  editForm.value.expire_date = built.normalized.expire_date
 
-  editForm.value.price = normalizedPrice
-  editForm.value.currency = normalizedCurrency
-  editForm.value.billing_cycle = normalizedBillingCycle
-  editForm.value.expire_date = normalizedExpireDate
-
-  const data = {
-    action: 'edit',
-    id: editForm.value.id,
-    name: editForm.value.name,
-    server_group: editForm.value.server_group,
-    region: editForm.value.region,
-    tags: editForm.value.tags,
-    note: editForm.value.note,
-    price: normalizedPrice,
-    billing_cycle: normalizedBillingCycle,
-    auto_renewal: normalizedAutoRenewal,
-    currency: normalizedCurrency,
-    expire_date: normalizedExpireDate,
-    traffic_limit: editForm.value.traffic_limit,
-    traffic_calc_type: editForm.value.traffic_calc_type,
-    traffic_alert_percent: normalizeTrafficAlertPercentField(editForm.value.traffic_alert_percent),
-    interface: editForm.value.interface,
-    reset_day: editForm.value.reset_day,
-    collect_interval: editForm.value.collect_interval,
-    report_interval: editForm.value.report_interval,
-    wss_report_interval: editForm.value.wss_report_interval,
-    connection_mode: getEffectiveConnectionMode(editForm.value.connection_mode),
-    ping_mode: editForm.value.ping_mode === 'icmp' ? 'icmp' : 'tcp',
-    custom_ct: pingNodeValidation.values.custom_ct,
-    custom_cu: pingNodeValidation.values.custom_cu,
-    custom_cm: pingNodeValidation.values.custom_cm,
-    custom_bd: pingNodeValidation.values.custom_bd,
-    node_1: pingNodeValidation.values.node_1, node_2: pingNodeValidation.values.node_2, node_3: pingNodeValidation.values.node_3, node_4: pingNodeValidation.values.node_4,
-    rx_correction: editForm.value.rx_correction,
-    tx_correction: editForm.value.tx_correction,
-    auto_update: editForm.value.auto_update ? '1' : '0',
-    is_hidden: editForm.value.is_hidden ? '1' : '0',
-    offline_notify_disabled: editForm.value.offline_notify_disabled ? '1' : '0'
-  }
-
+  editSaving.value = true
   try {
-    const result = await adminApiForSite(data)
+    const result = await adminApiForSite(built.payload)
     if (!result.error) {
       saveResult.value = { success: true, message: getMessage(result.data.message) || trans.value.serverEdited }
       cancelAutoUpdateWarning()
       showEditModal.value = false
-      loadServers()
+      await loadServers()
     } else {
       saveResult.value = { success: false, error: getMessage(result.error) || 'Fail' }
     }
   } catch (e) {
     saveResult.value = { success: false, error: e.message }
+  } finally {
+    editSaving.value = false
   }
 }
 
@@ -2308,42 +2514,67 @@ const openDeleteModal = (id) => {
 }
 
 const closeDeleteModal = () => {
+  if (deletingServer.value) return
   showDeleteModal.value = false
 }
 
 const confirmDelete = async () => {
+  if (deletingServer.value) return
+  deletingServer.value = true
   try {
     const result = await adminApiForSite({ action: 'delete', id: deleteServerId.value })
     if (!result.error) {
       saveResult.value = { success: true, message: getMessage(result.data.message) || trans.value.serverDeleted }
       showDeleteModal.value = false
-      loadServers()
+      selectedServers.value = selectedServers.value.filter(id => String(id) !== String(deleteServerId.value))
+      await loadServers()
     } else {
       saveResult.value = { success: false, error: getMessage(result.error) || 'Fail' }
     }
   } catch (e) {
     saveResult.value = { success: false, error: e.message }
+  } finally {
+    deletingServer.value = false
   }
 }
 
-const batchDelete = async () => {
+const batchDelete = () => {
+  if (deletingServer.value) return
   if (selectedServers.value.length === 0) {
     alertMessage.value = trans.value.selectServers
     return
   }
-  if (!confirm(trans.value.confirmDeleteServers + selectedServers.value.length + trans.value.irreversible)) return
+  showBatchDeleteConfirm.value = true
+}
 
+const cancelBatchDeleteConfirm = () => {
+  if (deletingServer.value) return
+  showBatchDeleteConfirm.value = false
+}
+
+const executeBatchDelete = async () => {
+  if (deletingServer.value) return
+  if (selectedServers.value.length === 0) {
+    showBatchDeleteConfirm.value = false
+    return
+  }
+
+  deletingServer.value = true
   try {
     const result = await adminApiForSite({ action: 'batch_delete', ids: selectedServers.value })
+    showBatchDeleteConfirm.value = false
     if (!result.error) {
       saveResult.value = { success: true, message: getMessage(result.data.message) || trans.value.serversDeleted }
       selectedServers.value = []
-      loadServers()
+      await loadServers()
     } else {
       saveResult.value = { success: false, error: getMessage(result.error) || 'Fail' }
     }
   } catch (e) {
+    showBatchDeleteConfirm.value = false
     saveResult.value = { success: false, error: e.message }
+  } finally {
+    deletingServer.value = false
   }
 }
 
@@ -2376,7 +2607,66 @@ const openBatchEditModal = () => {
 
 const closeBatchEditModal = () => {
   if (batchEditing.value) return
+  pendingBatchTasks.value = []
   showBatchEditModal.value = false
+}
+
+const executeBatchEditTasks = async (tasks) => {
+  if (batchEditing.value || !Array.isArray(tasks) || tasks.length === 0) return
+
+  validationError.value = null
+  batchEditing.value = true
+
+  const succeededIds = []
+  const failedItems = []
+
+  try {
+    for (const task of tasks) {
+      try {
+        const result = await adminApiForSite(task.payload)
+        if (result.error) {
+          failedItems.push({
+            id: task.id,
+            name: task.name,
+            error: getMessage(result.error) || result.error || trans.value.operationFailed
+          })
+        } else {
+          succeededIds.push(task.id)
+        }
+      } catch (e) {
+        failedItems.push({
+          id: task.id,
+          name: task.name,
+          error: e?.message || trans.value.operationFailed
+        })
+      }
+    }
+
+    if (succeededIds.length > 0) {
+      await loadServers()
+    }
+
+    if (failedItems.length === 0) {
+      selectedServers.value = []
+      showBatchEditModal.value = false
+      saveResult.value = {
+        success: true,
+        message: (trans.value.batchEditSuccess || 'Batch edit completed').replace('{count}', String(succeededIds.length))
+      }
+    } else {
+      selectedServers.value = failedItems.map(item => item.id)
+      const summary = (trans.value.batchEditPartialFailed || 'Succeeded: {success}, Failed: {failed}')
+        .replace('{success}', String(succeededIds.length))
+        .replace('{failed}', String(failedItems.length))
+      const detail = failedItems.slice(0, 5).map(item => `${item.name}: ${item.error}`).join('; ')
+      saveResult.value = {
+        success: false,
+        error: detail ? `${summary} (${detail})` : summary
+      }
+    }
+  } finally {
+    batchEditing.value = false
+  }
 }
 
 const saveBatchEdit = async () => {
@@ -2394,46 +2684,42 @@ const saveBatchEdit = async () => {
     return
   }
 
-  if (batchEditEnabled.value.auto_update && batchEditForm.value.auto_update) {
-    const ok = confirm(trans.value.autoUpdateRiskDesc || trans.value.autoUpdateRiskTitle || 'Enable auto-update?')
-    if (!ok) return
-  }
-
   validationError.value = null
-  batchEditing.value = true
-
-  try {
-    let updated = 0
-    for (const server of selected) {
-      const form = createEditFormFromServer(server)
-      for (const field of enabledFields) {
-        form[field] = batchEditForm.value[field]
-      }
-      const built = buildEditPayloadFromForm(form)
-      if (built.error) {
-        validationError.value = built.error
-        return
-      }
-      const result = await adminApiForSite(built.payload)
-      if (result.error) {
-        saveResult.value = { success: false, error: getMessage(result.error) || 'Fail' }
-        return
-      }
-      updated += 1
-    }
-
-    saveResult.value = {
-      success: true,
-      message: (trans.value.batchEditSuccess || 'Batch edit completed').replace('{count}', updated)
-    }
-    selectedServers.value = []
-    showBatchEditModal.value = false
-    await loadServers()
-  } catch (e) {
-    saveResult.value = { success: false, error: e.message }
-  } finally {
-    batchEditing.value = false
+  const enabledValidation = validateServerFormFields(batchEditForm.value, new Set(enabledFields))
+  if (!enabledValidation.valid) {
+    validationError.value = enabledValidation.error
+    return
   }
+
+  // 第一阶段：在内存中遍历全部选中服务器生成并校验所有 payload（任一非法立即中止，零网络请求）
+  const tasks = []
+  for (const server of selected) {
+    const form = createEditFormFromServer(server)
+    for (const field of enabledFields) {
+      form[field] = batchEditForm.value[field]
+    }
+    const built = buildEditPayloadFromForm(form)
+    if (built.error) {
+      const label = server.name || server.id
+      validationError.value = `${label}: ${built.error}`
+      return
+    }
+    tasks.push({
+      id: server.id,
+      name: server.name || server.id,
+      payload: built.payload
+    })
+  }
+
+  if (batchEditEnabled.value.auto_update && batchEditForm.value.auto_update) {
+    pendingBatchTasks.value = tasks
+    autoUpdateWarningSource.value = 'batch'
+    showAutoUpdateWarning.value = true
+    return
+  }
+
+  // 第二阶段：执行请求并汇总成功/失败项
+  await executeBatchEditTasks(tasks)
 }
 
 const handleSelectAll = (e) => {
@@ -2491,25 +2777,36 @@ const handleDrop = async (e, targetId) => {
   try {
     const result = await adminApiForSite({ action: 'save_order', orders })
     if (!result.error) {
-      loadServers()
+      await loadServers()
+    } else {
+      alertMessage.value = getMessage(result.error) || result.error || trans.value.operationFailed
+      await loadServers()
     }
   } catch (e) {
     console.error('[ERROR] Save order failed:', e)
+    alertMessage.value = e?.message || trans.value.operationFailed
+    await loadServers()
+  } finally {
+    draggedRow = null
   }
-
-  draggedRow = null
 }
 
 const uploadImageSetting = (e, field) => {
-  const file = e.target.files[0]
+  const input = e?.target
+  const file = input?.files?.[0]
   if (!file) return
   if (file.size > 800 * 1024) {
     alertMessage.value = trans.value.imageSizeWarning
+    input.value = ''
     return
   }
   const reader = new FileReader()
   reader.onload = function(event) {
     settings.value[field] = event.target.result
+    input.value = ''
+  }
+  reader.onerror = function() {
+    input.value = ''
   }
   reader.readAsDataURL(file)
 }
@@ -2632,6 +2929,14 @@ watch(() => route.query.apiIndex, async (value) => {
     await loadTurnstileConfig()
   }
 })
+
+useModal(showAutoUpdateWarning, cancelAutoUpdateWarning)
+useModal(showBatchDeleteConfirm, cancelBatchDeleteConfirm, { canClose: () => !deletingServer.value })
+useModal(showDbModal, closeDbModal, { canClose: () => !dbLoading.value })
+useModal(() => Boolean(d1UsageResult.value), () => { d1UsageResult.value = null })
+useModal(() => Boolean(validationError.value), () => { validationError.value = null })
+useModal(() => Boolean(saveResult.value), () => { saveResult.value = null })
+useModal(() => Boolean(alertMessage.value), () => { alertMessage.value = null })
 
 onMounted(() => {
   initAdmin()

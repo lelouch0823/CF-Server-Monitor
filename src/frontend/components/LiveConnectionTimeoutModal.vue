@@ -33,13 +33,17 @@
 </template>
 
 <script setup>
+import { useModal } from '../composables/useModal.js'
+
 const titleId = 'live-connection-timeout-title'
 const messageId = 'live-connection-timeout-message'
 
-defineProps({
+const props = defineProps({
   show: { type: Boolean, default: false },
   trans: { type: Object, required: true }
 })
 
-defineEmits(['close', 'continue'])
+const emit = defineEmits(['close', 'continue'])
+
+useModal(() => props.show, () => emit('close'))
 </script>

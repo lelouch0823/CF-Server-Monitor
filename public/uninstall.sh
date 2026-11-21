@@ -3,6 +3,7 @@
 # 支持: systemd、OpenRC、OpenWrt procd、Synology DSM rc.d、macOS launchd
 
 set -eu
+export LC_ALL=C LANG=C
 
 SERVICE_NAME="cf-probe"
 ASSUME_YES=0
@@ -14,12 +15,13 @@ die() { printf '%s\n' "[x] $*" >&2; exit 1; }
 usage() {
     cat <<'EOF'
 用法: sudo sh uninstall.sh [选项]
+  或: curl -fsSL https://example.com/uninstall.sh | sudo sh -s -- -y
 
 选项:
   -y, --yes          不询问，直接卸载
   -h, --help         显示本帮助
 
-默认会删除服务、探针脚本、配置、流量统计和日志。
+默认会删除服务、探针脚本、延迟自动更新任务、配置、流量统计和日志。
 EOF
 }
 
@@ -35,18 +37,60 @@ done
 [ "$(id -u)" -eq 0 ] || die "请以 root 权限运行，例如：sudo sh uninstall.sh"
 
 if [ "$ASSUME_YES" -ne 1 ]; then
-    printf '%s' "这会停止并删除 CF-Server-Monitor 探针及其数据。继续吗？[y/N] "
-    read -r answer || answer=""
+    if [ -t 0 ]; then
+        printf '%s' "这会停止并删除 CF-Server-Monitor 探针及其数据。继续吗？[y/N] "
+        read -r answer || answer=""
+    elif ( : </dev/tty ) 2>/dev/null; then
+        printf '%s' "这会停止并删除 CF-Server-Monitor 探针及其数据。继续吗？[y/N] " >/dev/tty 2>/dev/null || \
+            printf '%s' "这会停止并删除 CF-Server-Monitor 探针及其数据。继续吗？[y/N] "
+        read -r answer </dev/tty || answer=""
+    else
+        die "当前为非交互管道输入且无可用终端 (/dev/tty)。请传入 -s -- -y 确认卸载，例如：curl -fsSL <URL>/uninstall.sh | sudo sh -s -- -y"
+    fi
     case "$answer" in
         y|Y|yes|YES) ;;
         *) info "已取消。"; exit 0 ;;
     esac
 fi
 
+kill_matching_processes() {
+    _pat="$1"
+    _self="$$"
+    _ppid="${PPID:-0}"
+    (ps -axo pid=,command= 2>/dev/null || ps -eo pid=,args= 2>/dev/null || ps -ww 2>/dev/null || ps 2>/dev/null) | \
+        PAT="$_pat" awk -v sp="$_self" -v pp="$_ppid" '
+            $1 ~ /^[0-9]+$/ && $1 != sp && $1 != pp && index($0, ENVIRON["PAT"]) > 0 { print $1 }
+        ' | while IFS= read -r _pid; do
+            [ -n "$_pid" ] && kill -9 "$_pid" 2>/dev/null || true
+        done
+}
+
+cancel_auto_update_tasks() {
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl stop "${SERVICE_NAME}-auto-update-*" 2>/dev/null || true
+        for _unit in $(systemctl list-units --all --no-legend 2>/dev/null | awk -v svc="${SERVICE_NAME}" '$1 ~ svc"-auto-update-" { print $1 }'); do
+            systemctl stop "$_unit" 2>/dev/null || true
+            systemctl reset-failed "$_unit" 2>/dev/null || true
+        done
+    fi
+    # 清理 Alpine / macOS / OpenWrt / 群晖 / 容器后台延迟自动更新与安装子进程（排除当前 PID $$）
+    kill_matching_processes ".auto_update."
+    kill_matching_processes "cf-probe-auto-update"
+    kill_matching_processes "auto_update_install"
+    (ps -axo pid=,command= 2>/dev/null || ps -eo pid=,args= 2>/dev/null || ps -ww 2>/dev/null || ps 2>/dev/null) | \
+        awk -v sp="$$" -v pp="${PPID:-0}" '
+            $1 ~ /^[0-9]+$/ && $1 != sp && $1 != pp &&
+            (($0 ~ /[s]leep/ && ($0 ~ /[a]uto_update/ || $0 ~ /[i]nstall(-alpine|-mac|-openwrt|-synology)?\.sh/ || $0 ~ /[b]ash -s install/)) ||
+             ($0 ~ /[c]f-probe/ && $0 ~ /[a]uto_update/)) {
+                print $1
+            }
+        ' | while IFS= read -r _pid; do
+            [ -n "$_pid" ] && kill -9 "$_pid" 2>/dev/null || true
+        done
+}
+
 stop_systemd() {
     if command -v systemctl >/dev/null 2>&1; then
-        # 取消尚未执行的自动更新，避免卸载后被延迟任务重新安装。
-        systemctl stop "${SERVICE_NAME}-auto-update-*" 2>/dev/null || true
         systemctl stop "${SERVICE_NAME}.service" 2>/dev/null || true
         systemctl disable "${SERVICE_NAME}.service" 2>/dev/null || true
     fi
@@ -81,6 +125,9 @@ stop_synology() {
     fi
 }
 
+info "取消待执行的自动更新任务..."
+cancel_auto_update_tasks
+
 info "停止并取消注册服务..."
 stop_systemd
 stop_openrc
@@ -102,29 +149,27 @@ if command -v systemctl >/dev/null 2>&1; then
     systemctl reset-failed "$SERVICE_NAME" 2>/dev/null || true
 fi
 
-# 安装脚本也支持无服务管理器的容器/精简系统运行方式。
 for pid_file in /run/cf-probe.pid /var/run/cf-probe.pid; do
     if [ -r "$pid_file" ]; then
         pid=$(cat "$pid_file" 2>/dev/null || true)
         case "$pid" in
             ''|*[!0-9]*) warn "忽略无效 PID 文件: $pid_file" ;;
-            *) kill "$pid" 2>/dev/null || true ;;
+            *) [ "$pid" != "$$" ] && kill "$pid" 2>/dev/null || true ;;
         esac
     fi
     rm -f "$pid_file"
 done
 
-# PID 文件可能因异常退出或手工清理而丢失；以安装器写入的绝对脚本路径兜底。
-if command -v pkill >/dev/null 2>&1; then
-    pkill -9 -f "/usr/local/bin/${SERVICE_NAME}.sh" 2>/dev/null || true
-fi
+kill_matching_processes "/usr/local/bin/${SERVICE_NAME}.sh"
 
-rm -f /run/cf-probe-debug.env /var/log/cf-probe.log
+rm -f /run/cf-probe-debug.env /var/run/cf-probe-debug.env /var/log/cf-probe.log
 rm -f /dev/shm/.cf_ipv4 /dev/shm/.cf_ipv6 /dev/shm/.cf_probe_*
 rm -f /tmp/.cf_ipv4 /tmp/.cf_ipv6 /tmp/.cf_probe_*
 
-info "删除配置、流量统计和临时文件..."
+info "删除配置、流量统计和运行目录..."
 rm -rf \
+    /run/cf-probe \
+    /var/run/cf-probe \
     /etc/config/cf-probe \
     /usr/local/etc/cf-probe \
     "/Library/Application Support/cf-probe" \

@@ -7,8 +7,6 @@ on:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
   group: pages
@@ -23,9 +21,9 @@ jobs:
       - id: decide
         run: |
           if [ -n "$API_BASE" ] || [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            echo "should_deploy=true" >> $GITHUB_OUTPUT
+            echo "should_deploy=true" >> "$GITHUB_OUTPUT"
           else
-            echo "should_deploy=false" >> $GITHUB_OUTPUT
+            echo "should_deploy=false" >> "$GITHUB_OUTPUT"
           fi
         env:
           API_BASE: ${{ secrets.API_BASE }}
@@ -43,15 +41,16 @@ jobs:
           node-version: 22
           cache: npm
 
-      - run: npm install
+      - run: npm ci
 
       - name: Build
         env:
           API_BASE: ${{ secrets.API_BASE }}
-          CSP_STATIC: ${{ secrets.CSP_STATIC }}
           CSP_API: ${{ secrets.CSP_API }}
+          CSP_STATIC: ${{ secrets.CSP_STATIC }}
           TITLE: ${{ secrets.TITLE }}
           BACKGROUND_IMAGE: ${{ secrets.BACKGROUND_IMAGE }}
+          BACKGROUND_IMAGE_MOBILE: ${{ secrets.BACKGROUND_IMAGE_MOBILE }}
         run: npm run build:github-page
 
       - uses: actions/upload-pages-artifact@v3
@@ -62,6 +61,9 @@ jobs:
     needs: build
     if: needs.build.result == 'success'
     runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
